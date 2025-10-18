@@ -1,8 +1,9 @@
 import asyncio
 import ctypes
+import io
 import os
 from ctypes import c_int, c_char_p, c_void_p, Structure, POINTER, CFUNCTYPE
-from typing import Optional, Callable
+from typing import Optional
 
 from uvloop import loop
 from uvloop.loop import libuv_get_loop_t_ptr
@@ -74,7 +75,7 @@ def open(
     mode: int = 0o644,
     *,
     loop: Optional[asyncio.AbstractEventLoop] = None,
-) -> asyncio.Future[int]:
+) -> asyncio.Future[io.IOBase]:
     if loop is None:
         loop = asyncio.get_running_loop()
 
@@ -96,7 +97,7 @@ def open(
             error_msg = error_str.decode() if error_str else "Unknown error"
             fut.set_exception(OSError(result, error_msg))
         else:
-            fut.set_result(result)
+            fut.set_result(os.fdopen(result))
 
             uv.uv_fs_req_cleanup(req_ptr)
 
