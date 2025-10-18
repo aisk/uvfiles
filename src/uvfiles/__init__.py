@@ -74,7 +74,7 @@ def open(
     mode: int = 0o644,
     *,
     loop: Optional[asyncio.AbstractEventLoop] = None,
-) -> int:
+) -> asyncio.Future[int]:
     if loop is None:
         loop = asyncio.get_running_loop()
 
