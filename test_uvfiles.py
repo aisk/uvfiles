@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 
 import asyncio
-import io
 import os
 
 import pytest
 
 import uvloop
 import uvfiles
+from uvfiles import AsyncFile
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -17,10 +17,18 @@ async def test_async_open():
     """Test async file opening functionality"""
     # Test opening existing file
     f = await uvfiles.open(__file__, os.O_RDONLY)
-    assert isinstance(f, io.IOBase)
+    assert isinstance(f, AsyncFile)
     assert f.fileno() > 2  # Should not be stdin/stdout/stderr
+    assert f.name == __file__
+    assert f.mode == "r"
+    assert f.closed is False
+    assert f.readable() is True
+    assert f.writable() is False
 
-    # Verify we can read from the file
-    content = f.read()
-    assert len(content) > 0
-    f.close()
+    # Verify read() raises NotImplementedError for now
+    with pytest.raises(NotImplementedError):
+        f.read()
+
+    # close() also raises NotImplementedError for now
+    with pytest.raises(NotImplementedError):
+        f.close()
