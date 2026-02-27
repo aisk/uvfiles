@@ -212,7 +212,7 @@ class AsyncFile:
             uv_buf_t(ctypes.cast(read_buffer, POINTER(c_char)), size)
         )
 
-        req_ptr, req_token = _alloc_fs_request(read_buffer, uv_bufs)
+        req_ptr, req_addr = _alloc_fs_request(read_buffer, uv_bufs)
 
         def fs_callback(req_ptr):
             req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
@@ -227,20 +227,16 @@ class AsyncFile:
                     if not fut.done():
                         fut.set_result(data)
             finally:
-                uv.uv_fs_req_cleanup(req_ptr)
-                _remove_by_identity(_callback_registry, cb)
-                _remove_by_identity(_request_registry, req_token)
+                _cleanup_fs_request(req_ptr)
 
         cb = UV_FS_CB(fs_callback)
-        _callback_registry.append(cb)
+        _set_request_callback(req_addr, cb)
 
         result = uv.uv_fs_read(
             self._uv_loop, req_ptr, self._fd, uv_bufs, 1, offset, cb
         )
         if result < 0:
-            uv.uv_fs_req_cleanup(req_ptr)
-            _remove_by_identity(_callback_registry, cb)
-            _remove_by_identity(_request_registry, req_token)
+            _cleanup_fs_request(req_ptr, req_addr)
             raise _error_from_result(result)
 
         return await fut
@@ -253,7 +249,7 @@ class AsyncFile:
             uv_buf_t(ctypes.cast(write_buffer, POINTER(c_char)), len(payload))
         )
 
-        req_ptr, req_token = _alloc_fs_request(write_buffer, uv_bufs)
+        req_ptr, req_addr = _alloc_fs_request(write_buffer, uv_bufs)
 
         def fs_callback(req_ptr):
             req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
@@ -267,27 +263,23 @@ class AsyncFile:
                     if not fut.done():
                         fut.set_result(int(result))
             finally:
-                uv.uv_fs_req_cleanup(req_ptr)
-                _remove_by_identity(_callback_registry, cb)
-                _remove_by_identity(_request_registry, req_token)
+                _cleanup_fs_request(req_ptr)
 
         cb = UV_FS_CB(fs_callback)
-        _callback_registry.append(cb)
+        _set_request_callback(req_addr, cb)
 
         result = uv.uv_fs_write(
             self._uv_loop, req_ptr, self._fd, uv_bufs, 1, offset, cb
         )
         if result < 0:
-            uv.uv_fs_req_cleanup(req_ptr)
-            _remove_by_identity(_callback_registry, cb)
-            _remove_by_identity(_request_registry, req_token)
+            _cleanup_fs_request(req_ptr, req_addr)
             raise _error_from_result(result)
 
         return await fut
 
     async def _close_once(self) -> None:
         fut = self._loop.create_future()
-        req_ptr, req_token = _alloc_fs_request()
+        req_ptr, req_addr = _alloc_fs_request()
 
         def fs_callback(req_ptr):
             req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
@@ -301,18 +293,14 @@ class AsyncFile:
                     if not fut.done():
                         fut.set_result(None)
             finally:
-                uv.uv_fs_req_cleanup(req_ptr)
-                _remove_by_identity(_callback_registry, cb)
-                _remove_by_identity(_request_registry, req_token)
+                _cleanup_fs_request(req_ptr)
 
         cb = UV_FS_CB(fs_callback)
-        _callback_registry.append(cb)
+        _set_request_callback(req_addr, cb)
 
         result = uv.uv_fs_close(self._uv_loop, req_ptr, self._fd, cb)
         if result < 0:
-            uv.uv_fs_req_cleanup(req_ptr)
-            _remove_by_identity(_callback_registry, cb)
-            _remove_by_identity(_request_registry, req_token)
+            _cleanup_fs_request(req_ptr, req_addr)
             raise _error_from_result(result)
 
         await fut
@@ -406,25 +394,53 @@ UV_FS_REQ_TYPE = 6
 ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
 ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
 
-# Global registry to keep callbacks and requests alive
-_callback_registry = []
-_request_registry = []
+class _FsRequestContext:
+    __slots__ = ("req_buf", "refs", "cb")
+
+    def __init__(self, req_buf: Any, refs: tuple[Any, ...]) -> None:
+        self.req_buf = req_buf
+        self.refs = refs
+        self.cb: Optional[Any] = None
 
 
-def _remove_by_identity(registry: List[Any], target: Any) -> None:
-    for idx, item in enumerate(registry):
-        if item is target:
-            registry.pop(idx)
-            break
+_pending_requests: dict[int, _FsRequestContext] = {}
 
 
-def _alloc_fs_request(*refs: Any) -> tuple[POINTER(uv_fs_t), Any]:
+def _req_addr_from_ptr(req_ptr: POINTER(uv_fs_t)) -> int:
+    addr = ctypes.cast(req_ptr, c_void_p).value
+    if addr is None:
+        raise RuntimeError("null request pointer")
+    return int(addr)
+
+
+def _alloc_fs_request(*refs: Any) -> tuple[POINTER(uv_fs_t), int]:
     req_size = uv.uv_req_size(UV_FS_REQ_TYPE)
     req_buf = ctypes.create_string_buffer(req_size)
     req_ptr = ctypes.cast(req_buf, POINTER(uv_fs_t))
-    token = (req_buf, *refs)
-    _request_registry.append(token)
-    return req_ptr, token
+    req_addr = ctypes.addressof(req_buf)
+    _pending_requests[req_addr] = _FsRequestContext(req_buf, refs)
+    return req_ptr, req_addr
+
+
+def _set_request_callback(req_addr: int, cb: UV_FS_CB) -> None:
+    context = _pending_requests.get(req_addr)
+    if context is None:
+        raise RuntimeError("request context missing before callback setup")
+    context.cb = cb
+
+
+def _cleanup_fs_request(req_ptr: POINTER(uv_fs_t), req_addr: Optional[int] = None) -> None:
+    if req_addr is None:
+        req_addr = _req_addr_from_ptr(req_ptr)
+
+    context = _pending_requests.pop(req_addr, None)
+    if context is None:
+        return
+
+    uv.uv_fs_req_cleanup(req_ptr)
+    context.cb = None
+    context.refs = ()
+    context.req_buf = None
 
 
 def _error_from_result(result: int) -> OSError:
@@ -466,7 +482,7 @@ def open(
 
     uv_loop = _get_uv_loop_ptr(loop)
 
-    req_ptr, req_token = _alloc_fs_request()
+    req_ptr, req_addr = _alloc_fs_request()
 
     fut = loop.create_future()
     file_mode = _flags_to_mode(flags)
@@ -483,22 +499,18 @@ def open(
                 if not fut.done():
                     fut.set_result(AsyncFile(result, path, loop, file_mode))
         finally:
-            uv.uv_fs_req_cleanup(req_ptr)
-            _remove_by_identity(_callback_registry, cb)
-            _remove_by_identity(_request_registry, req_token)
+            _cleanup_fs_request(req_ptr)
 
     cb = UV_FS_CB(fs_callback)
-    _callback_registry.append(cb)
+    _set_request_callback(req_addr, cb)
 
     result = uv.uv_fs_open(
         uv_loop, req_ptr, path.encode("utf-8"), flags, mode, cb
     )
 
     if result < 0:
-        uv.uv_fs_req_cleanup(req_ptr)
+        _cleanup_fs_request(req_ptr, req_addr)
         fut.set_exception(_error_from_result(result))
-        _remove_by_identity(_callback_registry, cb)
-        _remove_by_identity(_request_registry, req_token)
 
     return fut
 
