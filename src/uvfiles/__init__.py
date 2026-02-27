@@ -2,10 +2,13 @@ import asyncio
 import ctypes
 import os
 from ctypes import (
+    c_char,
     c_int,
     c_char_p,
+    c_longlong,
     c_size_t,
     c_ssize_t,
+    c_uint,
     c_void_p,
     Structure,
     POINTER,
@@ -23,10 +26,19 @@ uv = ctypes.CDLL(loop.__file__)
 class AsyncFile:
     """Async file object compatible with Python's built-in file object interface."""
 
-    def __init__(self, fd: int, name: str, mode: str = "r") -> None:
+    def __init__(
+        self,
+        fd: int,
+        name: str,
+        loop: asyncio.AbstractEventLoop,
+        mode: str = "r",
+    ) -> None:
         self._fd = fd
         self._name = name
+        self._loop = loop
+        self._uv_loop = _get_uv_loop_ptr(loop)
         self._mode = mode
+        self._pos = 0
         self._closed = False
 
     @property
@@ -60,11 +72,33 @@ class AsyncFile:
 
     def seekable(self) -> bool:
         """Return True if the file is seekable."""
-        raise NotImplementedError("seekable() is not implemented yet")
+        self._ensure_open()
+        return True
 
-    def read(self, size: int = -1) -> bytes:
+    async def read(self, size: int = -1) -> bytes:
         """Read and return up to size bytes."""
-        raise NotImplementedError("read() is not implemented yet")
+        self._ensure_open()
+        self._ensure_loop()
+
+        if size == 0:
+            return b""
+
+        if size > 0:
+            data = await self._read_once(size, self._pos)
+            self._pos += len(data)
+            return data
+
+        chunks = []
+        chunk_size = 64 * 1024
+
+        while True:
+            data = await self._read_once(chunk_size, self._pos)
+            if not data:
+                break
+            chunks.append(data)
+            self._pos += len(data)
+
+        return b"".join(chunks)
 
     def readline(self, size: int = -1) -> bytes:
         """Read and return one line from the file."""
@@ -74,9 +108,21 @@ class AsyncFile:
         """Read and return a list of lines from the file."""
         raise NotImplementedError("readlines() is not implemented yet")
 
-    def write(self, data: bytes) -> int:
+    async def write(self, data: bytes) -> int:
         """Write data to the file."""
-        raise NotImplementedError("write() is not implemented yet")
+        self._ensure_open()
+        self._ensure_loop()
+
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError("a bytes-like object is required, not str")
+
+        payload = bytes(data)
+        if not payload:
+            return 0
+
+        written = await self._write_once(payload, self._pos)
+        self._pos += written
+        return written
 
     def writelines(self, lines: List[bytes]) -> None:
         """Write a list of lines to the file."""
@@ -84,11 +130,27 @@ class AsyncFile:
 
     def seek(self, offset: int, whence: int = 0) -> int:
         """Change the stream position."""
-        raise NotImplementedError("seek() is not implemented yet")
+        self._ensure_open()
+
+        if whence == os.SEEK_SET:
+            new_pos = offset
+        elif whence == os.SEEK_CUR:
+            new_pos = self._pos + offset
+        elif whence == os.SEEK_END:
+            new_pos = os.fstat(self._fd).st_size + offset
+        else:
+            raise ValueError("invalid whence")
+
+        if new_pos < 0:
+            raise ValueError("negative seek position")
+
+        self._pos = new_pos
+        return self._pos
 
     def tell(self) -> int:
         """Return the current stream position."""
-        raise NotImplementedError("tell() is not implemented yet")
+        self._ensure_open()
+        return self._pos
 
     def truncate(self, size: Optional[int] = None) -> int:
         """Truncate the file to at most size bytes."""
@@ -98,17 +160,29 @@ class AsyncFile:
         """Flush the write buffers."""
         raise NotImplementedError("flush() is not implemented yet")
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """Close the file."""
-        raise NotImplementedError("close() is not implemented yet")
+        if self._closed:
+            return
+
+        self._ensure_loop()
+        await self._close_once()
+        self._closed = True
 
     def __enter__(self) -> "AsyncFile":
         """Enter the runtime context."""
-        return self
+        raise TypeError("AsyncFile only supports async context manager, use 'async with'")
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Exit the runtime context and close the file."""
-        self.close()
+        raise TypeError("AsyncFile only supports async context manager, use 'async with'")
+
+    async def __aenter__(self) -> "AsyncFile":
+        self._ensure_open()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.close()
 
     def __iter__(self) -> Iterator[bytes]:
         """Iterate over lines in the file."""
@@ -121,6 +195,128 @@ class AsyncFile:
     def __repr__(self) -> str:
         return f"<AsyncFile name={self._name!r} mode={self._mode!r} closed={self._closed}>"
 
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise ValueError("I/O operation on closed file")
+
+    def _ensure_loop(self) -> None:
+        running_loop = asyncio.get_running_loop()
+        if running_loop is not self._loop:
+            raise RuntimeError("AsyncFile is bound to a different event loop")
+
+    async def _read_once(self, size: int, offset: int) -> bytes:
+        fut = self._loop.create_future()
+
+        read_buffer = ctypes.create_string_buffer(size)
+        uv_bufs = (uv_buf_t * 1)(
+            uv_buf_t(ctypes.cast(read_buffer, POINTER(c_char)), size)
+        )
+
+        req_ptr, req_token = _alloc_fs_request(read_buffer, uv_bufs)
+
+        def fs_callback(req_ptr):
+            req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
+            result = req_view.result
+
+            try:
+                if result < 0:
+                    if not fut.done():
+                        fut.set_exception(_error_from_result(result))
+                else:
+                    data = read_buffer.raw[: int(result)]
+                    if not fut.done():
+                        fut.set_result(data)
+            finally:
+                uv.uv_fs_req_cleanup(req_ptr)
+                _remove_by_identity(_callback_registry, cb)
+                _remove_by_identity(_request_registry, req_token)
+
+        cb = UV_FS_CB(fs_callback)
+        _callback_registry.append(cb)
+
+        result = uv.uv_fs_read(
+            self._uv_loop, req_ptr, self._fd, uv_bufs, 1, offset, cb
+        )
+        if result < 0:
+            uv.uv_fs_req_cleanup(req_ptr)
+            _remove_by_identity(_callback_registry, cb)
+            _remove_by_identity(_request_registry, req_token)
+            raise _error_from_result(result)
+
+        return await fut
+
+    async def _write_once(self, payload: bytes, offset: int) -> int:
+        fut = self._loop.create_future()
+
+        write_buffer = ctypes.create_string_buffer(payload, len(payload))
+        uv_bufs = (uv_buf_t * 1)(
+            uv_buf_t(ctypes.cast(write_buffer, POINTER(c_char)), len(payload))
+        )
+
+        req_ptr, req_token = _alloc_fs_request(write_buffer, uv_bufs)
+
+        def fs_callback(req_ptr):
+            req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
+            result = req_view.result
+
+            try:
+                if result < 0:
+                    if not fut.done():
+                        fut.set_exception(_error_from_result(result))
+                else:
+                    if not fut.done():
+                        fut.set_result(int(result))
+            finally:
+                uv.uv_fs_req_cleanup(req_ptr)
+                _remove_by_identity(_callback_registry, cb)
+                _remove_by_identity(_request_registry, req_token)
+
+        cb = UV_FS_CB(fs_callback)
+        _callback_registry.append(cb)
+
+        result = uv.uv_fs_write(
+            self._uv_loop, req_ptr, self._fd, uv_bufs, 1, offset, cb
+        )
+        if result < 0:
+            uv.uv_fs_req_cleanup(req_ptr)
+            _remove_by_identity(_callback_registry, cb)
+            _remove_by_identity(_request_registry, req_token)
+            raise _error_from_result(result)
+
+        return await fut
+
+    async def _close_once(self) -> None:
+        fut = self._loop.create_future()
+        req_ptr, req_token = _alloc_fs_request()
+
+        def fs_callback(req_ptr):
+            req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
+            result = req_view.result
+
+            try:
+                if result < 0:
+                    if not fut.done():
+                        fut.set_exception(_error_from_result(result))
+                else:
+                    if not fut.done():
+                        fut.set_result(None)
+            finally:
+                uv.uv_fs_req_cleanup(req_ptr)
+                _remove_by_identity(_callback_registry, cb)
+                _remove_by_identity(_request_registry, req_token)
+
+        cb = UV_FS_CB(fs_callback)
+        _callback_registry.append(cb)
+
+        result = uv.uv_fs_close(self._uv_loop, req_ptr, self._fd, cb)
+        if result < 0:
+            uv.uv_fs_req_cleanup(req_ptr)
+            _remove_by_identity(_callback_registry, cb)
+            _remove_by_identity(_request_registry, req_token)
+            raise _error_from_result(result)
+
+        await fut
+
 
 # Define libuv structures and functions
 class uv_loop_t(Structure):
@@ -129,6 +325,13 @@ class uv_loop_t(Structure):
 
 class uv_fs_t(Structure):
     pass
+
+
+class uv_buf_t(Structure):
+    _fields_ = [
+        ("base", POINTER(c_char)),
+        ("len", c_size_t),
+    ]
 
 
 class uv_fs_req_view_t(Structure):
@@ -156,6 +359,36 @@ uv.uv_fs_open.argtypes = [
 ]
 uv.uv_fs_open.restype = c_int
 
+uv.uv_fs_read.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_int,
+    POINTER(uv_buf_t),
+    c_uint,
+    c_longlong,
+    c_void_p,
+]
+uv.uv_fs_read.restype = c_int
+
+uv.uv_fs_write.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_int,
+    POINTER(uv_buf_t),
+    c_uint,
+    c_longlong,
+    c_void_p,
+]
+uv.uv_fs_write.restype = c_int
+
+uv.uv_fs_close.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_int,
+    c_void_p,
+]
+uv.uv_fs_close.restype = c_int
+
 uv.uv_fs_req_cleanup.argtypes = [POINTER(uv_fs_t)]
 uv.uv_fs_req_cleanup.restype = None
 
@@ -176,6 +409,27 @@ ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_cha
 # Global registry to keep callbacks and requests alive
 _callback_registry = []
 _request_registry = []
+
+
+def _remove_by_identity(registry: List[Any], target: Any) -> None:
+    for idx, item in enumerate(registry):
+        if item is target:
+            registry.pop(idx)
+            break
+
+
+def _alloc_fs_request(*refs: Any) -> tuple[POINTER(uv_fs_t), Any]:
+    req_size = uv.uv_req_size(UV_FS_REQ_TYPE)
+    req_buf = ctypes.create_string_buffer(req_size)
+    req_ptr = ctypes.cast(req_buf, POINTER(uv_fs_t))
+    token = (req_buf, *refs)
+    _request_registry.append(token)
+    return req_ptr, token
+
+
+def _error_from_result(result: int) -> OSError:
+    error_str = uv.uv_strerror(result)
+    return OSError(result, error_str.decode() if error_str else "Unknown error")
 
 
 def _get_uv_loop_ptr(loop: asyncio.AbstractEventLoop) -> POINTER:
@@ -212,10 +466,7 @@ def open(
 
     uv_loop = _get_uv_loop_ptr(loop)
 
-    req_size = uv.uv_req_size(UV_FS_REQ_TYPE)
-    req_buf = ctypes.create_string_buffer(req_size)
-    req_ptr = ctypes.cast(req_buf, POINTER(uv_fs_t))
-    _request_registry.append(req_buf)
+    req_ptr, req_token = _alloc_fs_request()
 
     fut = loop.create_future()
     file_mode = _flags_to_mode(flags)
@@ -226,19 +477,15 @@ def open(
 
         try:
             if result < 0:
-                error_str = uv.uv_strerror(result)
-                error_msg = error_str.decode() if error_str else "Unknown error"
                 if not fut.done():
-                    fut.set_exception(OSError(result, error_msg))
+                    fut.set_exception(_error_from_result(result))
             else:
                 if not fut.done():
-                    fut.set_result(AsyncFile(result, path, file_mode))
+                    fut.set_result(AsyncFile(result, path, loop, file_mode))
         finally:
             uv.uv_fs_req_cleanup(req_ptr)
-            if cb in _callback_registry:
-                _callback_registry.remove(cb)
-            if req_buf in _request_registry:
-                _request_registry.remove(req_buf)
+            _remove_by_identity(_callback_registry, cb)
+            _remove_by_identity(_request_registry, req_token)
 
     cb = UV_FS_CB(fs_callback)
     _callback_registry.append(cb)
@@ -248,13 +495,10 @@ def open(
     )
 
     if result < 0:
-        error_str = uv.uv_strerror(result)
-        e = OSError(result, error_str.decode() if error_str else "Unknown error")
-        fut.set_exception(e)
-        if cb in _callback_registry:
-            _callback_registry.remove(cb)
-        if req_buf in _request_registry:
-            _request_registry.remove(req_buf)
+        uv.uv_fs_req_cleanup(req_ptr)
+        fut.set_exception(_error_from_result(result))
+        _remove_by_identity(_callback_registry, cb)
+        _remove_by_identity(_request_registry, req_token)
 
     return fut
 
