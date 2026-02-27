@@ -1,7 +1,16 @@
 import asyncio
 import ctypes
 import os
-from ctypes import c_int, c_char_p, c_void_p, Structure, POINTER, CFUNCTYPE
+from ctypes import (
+    c_int,
+    c_char_p,
+    c_size_t,
+    c_ssize_t,
+    c_void_p,
+    Structure,
+    POINTER,
+    CFUNCTYPE,
+)
 from typing import Optional, List, Iterator, Any
 
 from uvloop import loop
@@ -119,19 +128,20 @@ class uv_loop_t(Structure):
 
 
 class uv_fs_t(Structure):
+    pass
+
+
+class uv_fs_req_view_t(Structure):
+    """Minimal prefix view to read public uv_fs_t result safely."""
+
     _fields_ = [
-        # UV_REQ_FIELDS
         ("data", c_void_p),  # void* data
-        ("type", c_int),  # uv_req_type type (typically 4 bytes)
+        ("type", c_int),  # uv_req_type
         ("reserved", c_void_p * 6),  # void* reserved[6]
-        # uv_fs_s specific fields
         ("fs_type", c_int),  # uv_fs_type
         ("loop", c_void_p),  # uv_loop_t* loop
         ("cb", c_void_p),  # uv_fs_cb cb
-        ("result", c_int),  # ssize_t result
-        ("ptr", c_void_p),  # void* ptr
-        ("path", c_char_p),  # const char* path
-        ("statbuf", c_void_p),  # uv_stat_t statbuf
+        ("result", c_ssize_t),  # ssize_t result
     ]
 
 
@@ -149,11 +159,15 @@ uv.uv_fs_open.restype = c_int
 uv.uv_fs_req_cleanup.argtypes = [POINTER(uv_fs_t)]
 uv.uv_fs_req_cleanup.restype = None
 
+uv.uv_req_size.argtypes = [c_int]
+uv.uv_req_size.restype = c_size_t
+
 uv.uv_strerror.argtypes = [c_int]
 uv.uv_strerror.restype = ctypes.c_char_p
 
 # Define callback type
 UV_FS_CB = CFUNCTYPE(None, POINTER(uv_fs_t))
+UV_FS_REQ_TYPE = 6
 
 # Set up the function signature for PyCapsule_GetPointer
 ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
@@ -198,45 +212,49 @@ def open(
 
     uv_loop = _get_uv_loop_ptr(loop)
 
-    req = uv_fs_t()
-    _request_registry.append(req)
+    req_size = uv.uv_req_size(UV_FS_REQ_TYPE)
+    req_buf = ctypes.create_string_buffer(req_size)
+    req_ptr = ctypes.cast(req_buf, POINTER(uv_fs_t))
+    _request_registry.append(req_buf)
 
     fut = loop.create_future()
     file_mode = _flags_to_mode(flags)
 
     def fs_callback(req_ptr):
-        req = req_ptr.contents
-        _request_registry.append(req)
-        fut._req = req
-        result = req.result
+        req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
+        result = req_view.result
 
-        if result < 0:
-            error_str = uv.uv_strerror(result)
-            error_msg = error_str.decode() if error_str else "Unknown error"
-            fut.set_exception(OSError(result, error_msg))
-        else:
-            fut.set_result(AsyncFile(result, path, file_mode))
-
+        try:
+            if result < 0:
+                error_str = uv.uv_strerror(result)
+                error_msg = error_str.decode() if error_str else "Unknown error"
+                if not fut.done():
+                    fut.set_exception(OSError(result, error_msg))
+            else:
+                if not fut.done():
+                    fut.set_result(AsyncFile(result, path, file_mode))
+        finally:
             uv.uv_fs_req_cleanup(req_ptr)
+            if cb in _callback_registry:
+                _callback_registry.remove(cb)
+            if req_buf in _request_registry:
+                _request_registry.remove(req_buf)
 
     cb = UV_FS_CB(fs_callback)
     _callback_registry.append(cb)
 
     result = uv.uv_fs_open(
-        uv_loop, ctypes.byref(req), path.encode("utf-8"), flags, mode, cb
+        uv_loop, req_ptr, path.encode("utf-8"), flags, mode, cb
     )
 
     if result < 0:
         error_str = uv.uv_strerror(result)
         e = OSError(result, error_str.decode() if error_str else "Unknown error")
         fut.set_exception(e)
-
-    def fut_done_callback(fut):
-        _callback_registry.remove(cb)
-        _request_registry.remove(fut._req)
-        _request_registry.remove(req)
-
-    fut.add_done_callback(fut_done_callback)
+        if cb in _callback_registry:
+            _callback_registry.remove(cb)
+        if req_buf in _request_registry:
+            _request_registry.remove(req_buf)
 
     return fut
 
