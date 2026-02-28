@@ -16,11 +16,11 @@ from ctypes import (
 )
 from typing import Optional, List, Iterator, Any
 
-from uvloop import loop
+import uvloop.loop
 from uvloop.loop import libuv_get_loop_t_ptr
 
 
-uv = ctypes.CDLL(loop.__file__)
+uv = ctypes.CDLL(uvloop.loop.__file__)
 
 
 class AsyncFile:
@@ -599,6 +599,12 @@ class _FsRequestContext:
 _pending_requests: dict[int, _FsRequestContext] = {}
 
 
+_UVLOOP_REQUIRED_ERROR = (
+    "uvfiles requires a uvloop event loop; call "
+    "asyncio.set_event_loop_policy(uvloop.EventLoopPolicy()) before use"
+)
+
+
 def _req_addr_from_ptr(req_ptr: POINTER(uv_fs_t)) -> int:
     addr = ctypes.cast(req_ptr, c_void_p).value
     if addr is None:
@@ -641,21 +647,20 @@ def _error_from_result(result: int) -> OSError:
     return OSError(result, error_str.decode() if error_str else "Unknown error")
 
 
-def _get_uv_loop_ptr(loop: asyncio.AbstractEventLoop) -> POINTER:
+def _get_uv_loop_ptr(event_loop: asyncio.AbstractEventLoop) -> POINTER:
+    # Calling libuv_get_loop_t_ptr with a non-uvloop loop can abort the process
+    # in some environments, so fail fast in Python before crossing the C boundary.
+    if not type(event_loop).__module__.startswith("uvloop"):
+        raise RuntimeError(_UVLOOP_REQUIRED_ERROR)
+
     try:
-        capsule = libuv_get_loop_t_ptr(loop)
+        capsule = libuv_get_loop_t_ptr(event_loop)
         uv_loop_ptr = ctypes.pythonapi.PyCapsule_GetPointer(capsule, None)
     except (TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "uvfiles requires a uvloop event loop; call "
-            "asyncio.set_event_loop_policy(uvloop.EventLoopPolicy()) before use"
-        ) from exc
+        raise RuntimeError(_UVLOOP_REQUIRED_ERROR) from exc
 
     if not uv_loop_ptr:
-        raise RuntimeError(
-            "uvfiles requires a uvloop event loop; call "
-            "asyncio.set_event_loop_policy(uvloop.EventLoopPolicy()) before use"
-        )
+        raise RuntimeError(_UVLOOP_REQUIRED_ERROR)
 
     return ctypes.cast(uv_loop_ptr, POINTER(uv_loop_t))
 
