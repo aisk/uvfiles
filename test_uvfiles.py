@@ -12,6 +12,18 @@ from uvfiles import AsyncFile
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
+def test_open_requires_uvloop_loop(tmp_path):
+    path = tmp_path / "requires_uvloop.bin"
+    path.write_bytes(b"x")
+
+    non_uvloop = asyncio.DefaultEventLoopPolicy().new_event_loop()
+    try:
+        with pytest.raises(RuntimeError, match="requires a uvloop event loop"):
+            uvfiles.open(str(path), os.O_RDONLY, loop=non_uvloop)
+    finally:
+        non_uvloop.close()
+
+
 @pytest.mark.asyncio
 async def test_async_open_and_close(tmp_path):
     path = tmp_path / "open_close.bin"

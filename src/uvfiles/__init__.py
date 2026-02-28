@@ -642,8 +642,21 @@ def _error_from_result(result: int) -> OSError:
 
 
 def _get_uv_loop_ptr(loop: asyncio.AbstractEventLoop) -> POINTER:
-    capsule = libuv_get_loop_t_ptr(loop)
-    uv_loop_ptr = ctypes.pythonapi.PyCapsule_GetPointer(capsule, None)
+    try:
+        capsule = libuv_get_loop_t_ptr(loop)
+        uv_loop_ptr = ctypes.pythonapi.PyCapsule_GetPointer(capsule, None)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "uvfiles requires a uvloop event loop; call "
+            "asyncio.set_event_loop_policy(uvloop.EventLoopPolicy()) before use"
+        ) from exc
+
+    if not uv_loop_ptr:
+        raise RuntimeError(
+            "uvfiles requires a uvloop event loop; call "
+            "asyncio.set_event_loop_policy(uvloop.EventLoopPolicy()) before use"
+        )
+
     return ctypes.cast(uv_loop_ptr, POINTER(uv_loop_t))
 
 
