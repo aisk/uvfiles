@@ -1,4 +1,5 @@
 import asyncio
+import codecs
 import ctypes
 import os
 from ctypes import (
@@ -32,15 +33,36 @@ class AsyncFile:
         name: str,
         loop: asyncio.AbstractEventLoop,
         mode: str = "r",
+        *,
+        binary: bool = True,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+        newline: Optional[str] = None,
+        append: bool = False,
     ) -> None:
+        if not binary:
+            if encoding is None:
+                encoding = "utf-8"
+            if errors is None:
+                errors = "strict"
+            _validate_newline(newline)
+
         self._fd = fd
         self._name = name
         self._loop = loop
         self._uv_loop = _get_uv_loop_ptr(loop)
         self._mode = mode
-        self._pos = 0
+        self._binary = binary
+        self._encoding = encoding if not binary else None
+        self._errors = errors if not binary else None
+        self._newline = newline if not binary else None
+        self._pos = os.fstat(fd).st_size if append else 0
         self._closed = False
         self._read_buffer = bytearray()
+        self._text_buffer = ""
+        self._text_pending_cr = False
+        self._text_decoder_finalized = False
+        self._text_decoder = self._make_text_decoder()
 
     @property
     def name(self) -> str:
@@ -56,6 +78,16 @@ class AsyncFile:
     def closed(self) -> bool:
         """True if the file is closed."""
         return self._closed
+
+    @property
+    def encoding(self) -> Optional[str]:
+        """The text encoding."""
+        return self._encoding
+
+    @property
+    def errors(self) -> Optional[str]:
+        """The text error strategy."""
+        return self._errors
 
     def fileno(self) -> int:
         """Return the file descriptor."""
@@ -76,14 +108,248 @@ class AsyncFile:
         self._ensure_open()
         return True
 
-    async def read(self, size: int = -1) -> bytes:
+    def isatty(self) -> bool:
+        """Return True if the file is connected to a TTY device."""
+        self._ensure_open()
+        return os.isatty(self._fd)
+
+    async def read(self, size: int = -1) -> Any:
         """Read and return up to size bytes."""
         self._ensure_open()
         self._ensure_loop()
 
         if size == 0:
+            return b"" if self._binary else ""
+
+        if self._binary:
+            return await self._read_binary(size)
+        return await self._read_text(size)
+
+    async def readline(self, size: int = -1) -> Any:
+        """Read and return one line from the file."""
+        self._ensure_open()
+        self._ensure_loop()
+
+        if size == 0:
+            return b"" if self._binary else ""
+
+        if self._binary:
+            return await self._readline_binary(size)
+        return await self._readline_text(size)
+
+    async def readlines(self, hint: int = -1) -> List[Any]:
+        """Read and return a list of lines from the file."""
+        self._ensure_open()
+        self._ensure_loop()
+
+        lines = []
+        total = 0
+        eof = b"" if self._binary else ""
+
+        while True:
+            line = await self.readline()
+            if line == eof:
+                break
+
+            lines.append(line)
+            total += len(line)
+
+            if hint > 0 and total >= hint:
+                break
+
+        return lines
+
+    async def write(self, data: Any) -> int:
+        """Write data to the file."""
+        self._ensure_open()
+        self._ensure_loop()
+
+        if self._binary:
+            if not isinstance(data, (bytes, bytearray, memoryview)):
+                raise TypeError(
+                    f"a bytes-like object is required, not {type(data).__name__}"
+                )
+            payload = bytes(data)
+            result_size = None
+        else:
+            if not isinstance(data, str):
+                raise TypeError(f"write() argument must be str, not {type(data).__name__}")
+            result_size = len(data)
+            payload = self._translate_write_newlines(data).encode(
+                self._encoding or "utf-8", self._errors or "strict"
+            )
+
+        if not payload:
+            return 0
+
+        written = await self._write_once(payload, self._pos)
+        self._pos += written
+        if written:
+            self._reset_read_state()
+        return written if result_size is None else result_size
+
+    async def writelines(self, lines: List[Any]) -> None:
+        """Write a list of lines to the file."""
+        self._ensure_open()
+        self._ensure_loop()
+
+        for line in lines:
+            await self.write(line)
+
+    async def readinto(self, buffer: Any) -> int:
+        """Read bytes into a writable buffer and return the byte count."""
+        self._ensure_open()
+        self._ensure_loop()
+
+        if not self._binary:
+            raise TypeError("readinto() is only supported in binary mode")
+
+        view = memoryview(buffer)
+        if view.readonly:
+            raise TypeError("readinto() argument must be read-write bytes-like object")
+
+        byte_view = view.cast("B")
+        data = await self.read(len(byte_view))
+        size = len(data)
+        byte_view[:size] = data
+        return size
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        """Change the stream position."""
+        self._ensure_open()
+
+        if whence == os.SEEK_SET:
+            new_pos = offset
+        elif whence == os.SEEK_CUR:
+            new_pos = self._pos + offset
+        elif whence == os.SEEK_END:
+            new_pos = os.fstat(self._fd).st_size + offset
+        else:
+            raise ValueError("invalid whence")
+
+        if new_pos < 0:
+            raise ValueError("negative seek position")
+
+        self._pos = new_pos
+        self._reset_read_state()
+        return self._pos
+
+    def tell(self) -> int:
+        """Return the current stream position."""
+        self._ensure_open()
+        return self._pos
+
+    async def truncate(self, size: Optional[int] = None) -> int:
+        """Truncate the file to at most size bytes."""
+        self._ensure_open()
+        self._ensure_loop()
+
+        target_size = self._pos if size is None else size
+        if target_size < 0:
+            raise ValueError("negative size value")
+
+        await self._truncate_once(target_size)
+        self._reset_read_state()
+
+        if self._pos > target_size:
+            self._pos = target_size
+
+        return target_size
+
+    async def flush(self) -> None:
+        """Flush the write buffers."""
+        self._ensure_open()
+        self._ensure_loop()
+        await self._fsync_once()
+
+    async def close(self) -> None:
+        """Close the file."""
+        if self._closed:
+            return
+
+        self._ensure_loop()
+        await self._close_once()
+        self._closed = True
+
+    def __enter__(self) -> "AsyncFile":
+        """Enter the runtime context."""
+        raise TypeError("AsyncFile only supports async context manager, use 'async with'")
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Exit the runtime context and close the file."""
+        raise TypeError("AsyncFile only supports async context manager, use 'async with'")
+
+    async def __aenter__(self) -> "AsyncFile":
+        self._ensure_open()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.close()
+
+    def __aiter__(self) -> "AsyncFile":
+        self._ensure_open()
+        return self
+
+    async def __anext__(self) -> Any:
+        line = await self.readline()
+        if line == (b"" if self._binary else ""):
+            raise StopAsyncIteration
+        return line
+
+    def __iter__(self) -> Iterator[bytes]:
+        """Iterate over lines in the file."""
+        raise TypeError("AsyncFile is asynchronously iterable, use 'async for'")
+
+    def __next__(self) -> bytes:
+        """Return the next line from the file."""
+        raise TypeError("AsyncFile is asynchronously iterable, use 'async for'")
+
+    def __repr__(self) -> str:
+        return f"<AsyncFile name={self._name!r} mode={self._mode!r} closed={self._closed}>"
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise ValueError("I/O operation on closed file")
+
+    def _ensure_loop(self) -> None:
+        running_loop = asyncio.get_running_loop()
+        if running_loop is not self._loop:
+            raise RuntimeError("AsyncFile is bound to a different event loop")
+
+    def _make_text_decoder(self) -> Optional[Any]:
+        if self._binary:
+            return None
+
+        decoder_cls = codecs.getincrementaldecoder(self._encoding or "utf-8")
+        return decoder_cls(errors=self._errors or "strict")
+
+    def _reset_read_state(self) -> None:
+        self._read_buffer.clear()
+        self._text_buffer = ""
+        self._text_pending_cr = False
+        self._text_decoder_finalized = False
+        self._text_decoder = self._make_text_decoder()
+
+    def _consume_from_read_buffer(self, size: int) -> bytes:
+        available = min(size, len(self._read_buffer))
+        if available <= 0:
             return b""
 
+        data = bytes(self._read_buffer[:available])
+        del self._read_buffer[:available]
+        self._pos += available
+        return data
+
+    def _consume_text_buffer(self, size: int) -> str:
+        available = min(size, len(self._text_buffer))
+        if available <= 0:
+            return ""
+
+        data = self._text_buffer[:available]
+        self._text_buffer = self._text_buffer[available:]
+        return data
+
+    async def _read_binary(self, size: int = -1) -> bytes:
         if size > 0:
             chunks = []
             remaining = size
@@ -116,14 +382,7 @@ class AsyncFile:
 
         return b"".join(chunks)
 
-    async def readline(self, size: int = -1) -> bytes:
-        """Read and return one line from the file."""
-        self._ensure_open()
-        self._ensure_loop()
-
-        if size == 0:
-            return b""
-
+    async def _readline_binary(self, size: int = -1) -> bytes:
         limit = None if size < 0 else size
         chunks = []
         total = 0
@@ -165,164 +424,118 @@ class AsyncFile:
                 return b"".join(chunks)
             self._read_buffer.extend(data)
 
-    async def readlines(self, hint: int = -1) -> List[bytes]:
-        """Read and return a list of lines from the file."""
-        self._ensure_open()
-        self._ensure_loop()
+    async def _read_text(self, size: int = -1) -> str:
+        if size < 0:
+            while True:
+                data = await self._read_once(64 * 1024, self._pos)
+                if not data:
+                    self._finalize_text_decoder()
+                    break
+                self._pos += len(data)
+                self._append_decoded_text(data)
 
-        lines = []
+            return self._consume_text_buffer(len(self._text_buffer))
+
+        while len(self._text_buffer) < size:
+            data = await self._read_once(8 * 1024, self._pos)
+            if not data:
+                self._finalize_text_decoder()
+                break
+            self._pos += len(data)
+            self._append_decoded_text(data)
+
+        return self._consume_text_buffer(size)
+
+    async def _readline_text(self, size: int = -1) -> str:
+        limit = None if size < 0 else size
+        chunks: List[str] = []
         total = 0
 
         while True:
-            line = await self.readline()
-            if line == b"":
-                break
+            if limit is not None and total >= limit:
+                return "".join(chunks)
 
-            lines.append(line)
-            total += len(line)
+            ch = await self._read_text(1)
+            if ch == "":
+                return "".join(chunks)
 
-            if hint > 0 and total >= hint:
-                break
+            chunks.append(ch)
+            total += 1
 
-        return lines
+            if limit is not None and total >= limit:
+                return "".join(chunks)
 
-    async def write(self, data: bytes) -> int:
-        """Write data to the file."""
-        self._ensure_open()
-        self._ensure_loop()
+            if self._newline is None or self._newline == "\n":
+                if ch == "\n":
+                    return "".join(chunks)
+                continue
 
-        if not isinstance(data, (bytes, bytearray, memoryview)):
-            raise TypeError("a bytes-like object is required, not str")
+            if self._newline == "\r":
+                if ch == "\r":
+                    return "".join(chunks)
+                continue
 
-        payload = bytes(data)
-        if not payload:
-            return 0
+            if self._newline == "\r\n":
+                if len(chunks) >= 2 and chunks[-2] == "\r" and ch == "\n":
+                    return "".join(chunks)
+                continue
 
-        written = await self._write_once(payload, self._pos)
-        self._pos += written
-        if written:
-            self._read_buffer.clear()
-        return written
+            if self._newline == "":
+                if ch == "\n":
+                    return "".join(chunks)
+                if ch == "\r":
+                    next_ch = await self._read_text(1)
+                    if next_ch == "":
+                        return "".join(chunks)
+                    if next_ch == "\n":
+                        chunks.append(next_ch)
+                        total += 1
+                    else:
+                        self._text_buffer = next_ch + self._text_buffer
+                    return "".join(chunks)
 
-    async def writelines(self, lines: List[bytes]) -> None:
-        """Write a list of lines to the file."""
-        self._ensure_open()
-        self._ensure_loop()
-
-        for line in lines:
-            await self.write(line)
-
-    def seek(self, offset: int, whence: int = 0) -> int:
-        """Change the stream position."""
-        self._ensure_open()
-
-        if whence == os.SEEK_SET:
-            new_pos = offset
-        elif whence == os.SEEK_CUR:
-            new_pos = self._pos + offset
-        elif whence == os.SEEK_END:
-            new_pos = os.fstat(self._fd).st_size + offset
-        else:
-            raise ValueError("invalid whence")
-
-        if new_pos < 0:
-            raise ValueError("negative seek position")
-
-        self._pos = new_pos
-        self._read_buffer.clear()
-        return self._pos
-
-    def tell(self) -> int:
-        """Return the current stream position."""
-        self._ensure_open()
-        return self._pos
-
-    async def truncate(self, size: Optional[int] = None) -> int:
-        """Truncate the file to at most size bytes."""
-        self._ensure_open()
-        self._ensure_loop()
-
-        target_size = self._pos if size is None else size
-        if target_size < 0:
-            raise ValueError("negative size value")
-
-        await self._truncate_once(target_size)
-        self._read_buffer.clear()
-
-        if self._pos > target_size:
-            self._pos = target_size
-
-        return target_size
-
-    async def flush(self) -> None:
-        """Flush the write buffers."""
-        self._ensure_open()
-        self._ensure_loop()
-        await self._fsync_once()
-
-    async def close(self) -> None:
-        """Close the file."""
-        if self._closed:
+    def _append_decoded_text(self, data: bytes, *, final: bool = False) -> None:
+        if self._text_decoder is None:
             return
 
-        self._ensure_loop()
-        await self._close_once()
-        self._closed = True
+        decoded = self._text_decoder.decode(data, final=final)
+        translated = self._translate_read_newlines(decoded, final=final)
+        if translated:
+            self._text_buffer += translated
 
-    def __enter__(self) -> "AsyncFile":
-        """Enter the runtime context."""
-        raise TypeError("AsyncFile only supports async context manager, use 'async with'")
+    def _finalize_text_decoder(self) -> None:
+        if self._text_decoder_finalized:
+            return
 
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Exit the runtime context and close the file."""
-        raise TypeError("AsyncFile only supports async context manager, use 'async with'")
+        self._text_decoder_finalized = True
+        self._append_decoded_text(b"", final=True)
 
-    async def __aenter__(self) -> "AsyncFile":
-        self._ensure_open()
-        return self
+    def _translate_read_newlines(self, text: str, *, final: bool) -> str:
+        if self._newline is not None:
+            return text
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        await self.close()
+        if self._text_pending_cr:
+            text = "\r" + text
+            self._text_pending_cr = False
 
-    def __aiter__(self) -> "AsyncFile":
-        self._ensure_open()
-        return self
+        if not final and text.endswith("\r"):
+            self._text_pending_cr = True
+            text = text[:-1]
 
-    async def __anext__(self) -> bytes:
-        line = await self.readline()
-        if line == b"":
-            raise StopAsyncIteration
-        return line
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    def __iter__(self) -> Iterator[bytes]:
-        """Iterate over lines in the file."""
-        raise TypeError("AsyncFile is asynchronously iterable, use 'async for'")
+        if final and self._text_pending_cr:
+            text += "\n"
+            self._text_pending_cr = False
 
-    def __next__(self) -> bytes:
-        """Return the next line from the file."""
-        raise TypeError("AsyncFile is asynchronously iterable, use 'async for'")
+        return text
 
-    def __repr__(self) -> str:
-        return f"<AsyncFile name={self._name!r} mode={self._mode!r} closed={self._closed}>"
-
-    def _ensure_open(self) -> None:
-        if self._closed:
-            raise ValueError("I/O operation on closed file")
-
-    def _ensure_loop(self) -> None:
-        running_loop = asyncio.get_running_loop()
-        if running_loop is not self._loop:
-            raise RuntimeError("AsyncFile is bound to a different event loop")
-
-    def _consume_from_read_buffer(self, size: int) -> bytes:
-        available = min(size, len(self._read_buffer))
-        if available <= 0:
-            return b""
-
-        data = bytes(self._read_buffer[:available])
-        del self._read_buffer[:available]
-        self._pos += available
-        return data
+    def _translate_write_newlines(self, text: str) -> str:
+        if self._newline is None:
+            return text.replace("\n", os.linesep)
+        if self._newline in ("", "\n"):
+            return text
+        return text.replace("\n", self._newline)
 
     async def _read_once(self, size: int, offset: int) -> bytes:
         fut = self._loop.create_future()
@@ -681,13 +894,90 @@ def _flags_to_mode(flags: int) -> str:
         return "r"
 
 
+def _validate_newline(newline: Optional[str]) -> None:
+    if newline not in (None, "", "\n", "\r", "\r\n"):
+        raise ValueError("illegal newline value")
+
+
+def _parse_mode(mode: str) -> tuple[int, str, bool, bool]:
+    if not isinstance(mode, str):
+        raise TypeError("mode must be str")
+    if not mode:
+        raise ValueError("must have exactly one of create/read/write/append mode")
+
+    base_chars = {"r", "w", "a", "x"}
+    base = mode[0]
+    if base not in base_chars:
+        raise ValueError("must have exactly one of create/read/write/append mode")
+
+    plus = False
+    binary = False
+    text = False
+
+    for ch in mode[1:]:
+        if ch == "+":
+            if plus:
+                raise ValueError("invalid mode: duplicated '+'")
+            plus = True
+            continue
+        if ch == "b":
+            if binary:
+                raise ValueError("invalid mode: duplicated 'b'")
+            binary = True
+            continue
+        if ch == "t":
+            if text:
+                raise ValueError("invalid mode: duplicated 't'")
+            text = True
+            continue
+        raise ValueError(f"invalid mode: {mode!r}")
+
+    if binary and text:
+        raise ValueError("can't have text and binary mode at once")
+
+    if base == "r":
+        flags = os.O_RDONLY
+    elif base == "w":
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    elif base == "a":
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    else:  # base == "x"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+
+    if plus:
+        flags = (flags & ~os.O_WRONLY) | os.O_RDWR
+
+    normalized_mode = base
+    if plus:
+        normalized_mode += "+"
+    if binary:
+        normalized_mode += "b"
+    elif text:
+        normalized_mode += "t"
+
+    return flags, normalized_mode, binary, base == "a"
+
+
 def open(
     path: str,
-    flags: int = os.O_RDONLY,
+    mode_or_flags: str | int = "r",
     mode: int = 0o644,
     *,
+    buffering: int = -1,
+    encoding: Optional[str] = None,
+    errors: Optional[str] = None,
+    newline: Optional[str] = None,
     loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> asyncio.Future[AsyncFile]:
+    if not isinstance(path, str):
+        raise TypeError("path must be str")
+
+    if not isinstance(mode, int):
+        raise TypeError("mode must be int")
+
+    if buffering != -1:
+        raise NotImplementedError("buffering other than -1 is not supported")
+
     if loop is None:
         loop = asyncio.get_running_loop()
 
@@ -696,7 +986,27 @@ def open(
     req_ptr, req_addr = _alloc_fs_request()
 
     fut = loop.create_future()
-    file_mode = _flags_to_mode(flags)
+    resolved_encoding: Optional[str] = None
+    resolved_errors: Optional[str] = None
+    resolved_newline: Optional[str] = None
+
+    if isinstance(mode_or_flags, int):
+        flags = mode_or_flags
+        if encoding is not None or errors is not None or newline is not None:
+            raise ValueError("encoding/errors/newline are only supported in text mode")
+        file_mode = _flags_to_mode(flags)
+        binary = True
+        append = bool(flags & os.O_APPEND)
+    else:
+        flags, file_mode, binary, append = _parse_mode(mode_or_flags)
+        if binary:
+            if encoding is not None or errors is not None or newline is not None:
+                raise ValueError("binary mode doesn't take encoding/errors/newline")
+        else:
+            _validate_newline(newline)
+            resolved_encoding = encoding or "utf-8"
+            resolved_errors = errors or "strict"
+            resolved_newline = newline
 
     def fs_callback(req_ptr):
         req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
@@ -708,7 +1018,19 @@ def open(
                     fut.set_exception(_error_from_result(result))
             else:
                 if not fut.done():
-                    fut.set_result(AsyncFile(result, path, loop, file_mode))
+                    fut.set_result(
+                        AsyncFile(
+                            result,
+                            path,
+                            loop,
+                            file_mode,
+                            binary=binary,
+                            encoding=resolved_encoding,
+                            errors=resolved_errors,
+                            newline=resolved_newline,
+                            append=append,
+                        )
+                    )
         finally:
             _cleanup_fs_request(req_ptr)
 
@@ -726,4 +1048,7 @@ def open(
     return fut
 
 
-__all__ = ["open", "AsyncFile"]
+async_open = open
+
+
+__all__ = ["open", "async_open", "AsyncFile"]

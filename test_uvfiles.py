@@ -266,3 +266,131 @@ async def test_new_methods_on_closed_file_raise(tmp_path):
         await f.flush()
     with pytest.raises(ValueError):
         f.__aiter__()
+
+
+@pytest.mark.asyncio
+async def test_open_mode_string_text_roundtrip(tmp_path):
+    path = tmp_path / "text_roundtrip.txt"
+
+    f = await uvfiles.open(str(path), "w+")
+    written = await f.write("abc\n123")
+    assert written == 7
+    f.seek(0)
+    assert await f.read() == "abc\n123"
+    await f.close()
+
+
+@pytest.mark.asyncio
+async def test_open_default_mode_is_text(tmp_path):
+    path = tmp_path / "default_text.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    f = await uvfiles.open(str(path))
+    data = await f.read()
+    assert isinstance(data, str)
+    assert data == "hello"
+    await f.close()
+
+
+@pytest.mark.asyncio
+async def test_open_int_flags_keeps_binary_behavior(tmp_path):
+    path = tmp_path / "flags_binary.bin"
+    path.write_bytes(b"\xe4\xb8\xad")
+
+    f = await uvfiles.open(str(path), os.O_RDONLY)
+    data = await f.read()
+    assert isinstance(data, bytes)
+    assert data == b"\xe4\xb8\xad"
+    await f.close()
+
+
+@pytest.mark.asyncio
+async def test_text_encoding_roundtrip(tmp_path):
+    path = tmp_path / "encoding.txt"
+
+    f = await uvfiles.open(str(path), "w", encoding="utf-16-le")
+    await f.write("你好")
+    await f.close()
+
+    f = await uvfiles.open(str(path), "r", encoding="utf-16-le")
+    assert await f.read() == "你好"
+    await f.close()
+
+
+@pytest.mark.asyncio
+async def test_text_newline_none_normalizes_reads(tmp_path):
+    path = tmp_path / "newline_none.txt"
+    path.write_bytes(b"a\r\nb\rc\n")
+
+    f = await uvfiles.open(str(path), "r", newline=None)
+    assert await f.readline() == "a\n"
+    assert await f.readline() == "b\n"
+    assert await f.readline() == "c\n"
+    assert await f.readline() == ""
+    await f.close()
+
+
+@pytest.mark.asyncio
+async def test_text_newline_empty_preserves_endings(tmp_path):
+    path = tmp_path / "newline_empty.txt"
+    path.write_bytes(b"a\r\nb\rc\n")
+
+    f = await uvfiles.open(str(path), "r", newline="")
+    assert await f.readline() == "a\r\n"
+    assert await f.readline() == "b\r"
+    assert await f.readline() == "c\n"
+    await f.close()
+
+
+@pytest.mark.asyncio
+async def test_async_open_alias(tmp_path):
+    path = tmp_path / "alias.txt"
+    f = await uvfiles.async_open(str(path), "w+")
+    await f.write("alias")
+    f.seek(0)
+    assert await f.read() == "alias"
+    await f.close()
+
+
+@pytest.mark.asyncio
+async def test_isatty_and_closed_behavior(tmp_path):
+    path = tmp_path / "isatty.txt"
+    path.write_text("x", encoding="utf-8")
+
+    f = await uvfiles.open(str(path), "r")
+    assert f.isatty() is False
+    await f.close()
+    with pytest.raises(ValueError):
+        f.isatty()
+
+
+@pytest.mark.asyncio
+async def test_readinto_binary_mode(tmp_path):
+    path = tmp_path / "readinto.bin"
+    path.write_bytes(b"hello")
+
+    f = await uvfiles.open(str(path), os.O_RDONLY)
+    buf = bytearray(8)
+    n = await f.readinto(buf)
+    assert n == 5
+    assert bytes(buf[:n]) == b"hello"
+    await f.close()
+
+
+@pytest.mark.asyncio
+async def test_readinto_text_mode_rejected(tmp_path):
+    path = tmp_path / "readinto_text.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    f = await uvfiles.open(str(path), "r")
+    with pytest.raises(TypeError):
+        await f.readinto(bytearray(8))
+    await f.close()
+
+
+def test_open_buffering_not_supported(tmp_path):
+    path = tmp_path / "buffering.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    with pytest.raises(NotImplementedError):
+        uvfiles.open(str(path), "r", buffering=1)
