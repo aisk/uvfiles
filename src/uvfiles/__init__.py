@@ -40,6 +40,7 @@ class AsyncFile:
         self._mode = mode
         self._pos = 0
         self._closed = False
+        self._read_buffer = bytearray()
 
     @property
     def name(self) -> str:
@@ -84,12 +85,27 @@ class AsyncFile:
             return b""
 
         if size > 0:
-            data = await self._read_once(size, self._pos)
-            self._pos += len(data)
-            return data
+            chunks = []
+            remaining = size
+
+            if self._read_buffer:
+                buffered = self._consume_from_read_buffer(remaining)
+                if buffered:
+                    chunks.append(buffered)
+                    remaining -= len(buffered)
+
+            if remaining > 0:
+                data = await self._read_once(remaining, self._pos)
+                self._pos += len(data)
+                chunks.append(data)
+
+            return b"".join(chunks)
 
         chunks = []
         chunk_size = 64 * 1024
+
+        if self._read_buffer:
+            chunks.append(self._consume_from_read_buffer(len(self._read_buffer)))
 
         while True:
             data = await self._read_once(chunk_size, self._pos)
@@ -100,13 +116,75 @@ class AsyncFile:
 
         return b"".join(chunks)
 
-    def readline(self, size: int = -1) -> bytes:
+    async def readline(self, size: int = -1) -> bytes:
         """Read and return one line from the file."""
-        raise NotImplementedError("readline() is not implemented yet")
+        self._ensure_open()
+        self._ensure_loop()
 
-    def readlines(self, hint: int = -1) -> List[bytes]:
+        if size == 0:
+            return b""
+
+        limit = None if size < 0 else size
+        chunks = []
+        total = 0
+
+        while True:
+            if self._read_buffer:
+                remaining = None if limit is None else limit - total
+                if remaining == 0:
+                    return b"".join(chunks)
+
+                scan_end = (
+                    len(self._read_buffer)
+                    if remaining is None
+                    else min(len(self._read_buffer), remaining)
+                )
+                newline_idx = self._read_buffer.find(b"\n", 0, scan_end)
+
+                if newline_idx != -1:
+                    chunks.append(self._consume_from_read_buffer(newline_idx + 1))
+                    return b"".join(chunks)
+
+                if remaining is not None and scan_end == remaining:
+                    chunks.append(self._consume_from_read_buffer(scan_end))
+                    return b"".join(chunks)
+
+                take = len(self._read_buffer)
+                chunks.append(self._consume_from_read_buffer(take))
+                total += take
+
+            read_size = 8 * 1024
+            if limit is not None:
+                remaining = limit - total
+                if remaining <= 0:
+                    return b"".join(chunks)
+                read_size = min(read_size, remaining)
+
+            data = await self._read_once(read_size, self._pos)
+            if not data:
+                return b"".join(chunks)
+            self._read_buffer.extend(data)
+
+    async def readlines(self, hint: int = -1) -> List[bytes]:
         """Read and return a list of lines from the file."""
-        raise NotImplementedError("readlines() is not implemented yet")
+        self._ensure_open()
+        self._ensure_loop()
+
+        lines = []
+        total = 0
+
+        while True:
+            line = await self.readline()
+            if line == b"":
+                break
+
+            lines.append(line)
+            total += len(line)
+
+            if hint > 0 and total >= hint:
+                break
+
+        return lines
 
     async def write(self, data: bytes) -> int:
         """Write data to the file."""
@@ -122,11 +200,17 @@ class AsyncFile:
 
         written = await self._write_once(payload, self._pos)
         self._pos += written
+        if written:
+            self._read_buffer.clear()
         return written
 
-    def writelines(self, lines: List[bytes]) -> None:
+    async def writelines(self, lines: List[bytes]) -> None:
         """Write a list of lines to the file."""
-        raise NotImplementedError("writelines() is not implemented yet")
+        self._ensure_open()
+        self._ensure_loop()
+
+        for line in lines:
+            await self.write(line)
 
     def seek(self, offset: int, whence: int = 0) -> int:
         """Change the stream position."""
@@ -145,6 +229,7 @@ class AsyncFile:
             raise ValueError("negative seek position")
 
         self._pos = new_pos
+        self._read_buffer.clear()
         return self._pos
 
     def tell(self) -> int:
@@ -152,13 +237,28 @@ class AsyncFile:
         self._ensure_open()
         return self._pos
 
-    def truncate(self, size: Optional[int] = None) -> int:
+    async def truncate(self, size: Optional[int] = None) -> int:
         """Truncate the file to at most size bytes."""
-        raise NotImplementedError("truncate() is not implemented yet")
+        self._ensure_open()
+        self._ensure_loop()
 
-    def flush(self) -> None:
+        target_size = self._pos if size is None else size
+        if target_size < 0:
+            raise ValueError("negative size value")
+
+        await self._truncate_once(target_size)
+        self._read_buffer.clear()
+
+        if self._pos > target_size:
+            self._pos = target_size
+
+        return target_size
+
+    async def flush(self) -> None:
         """Flush the write buffers."""
-        raise NotImplementedError("flush() is not implemented yet")
+        self._ensure_open()
+        self._ensure_loop()
+        await self._fsync_once()
 
     async def close(self) -> None:
         """Close the file."""
@@ -184,13 +284,23 @@ class AsyncFile:
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await self.close()
 
+    def __aiter__(self) -> "AsyncFile":
+        self._ensure_open()
+        return self
+
+    async def __anext__(self) -> bytes:
+        line = await self.readline()
+        if line == b"":
+            raise StopAsyncIteration
+        return line
+
     def __iter__(self) -> Iterator[bytes]:
         """Iterate over lines in the file."""
-        raise NotImplementedError("__iter__() is not implemented yet")
+        raise TypeError("AsyncFile is asynchronously iterable, use 'async for'")
 
     def __next__(self) -> bytes:
         """Return the next line from the file."""
-        raise NotImplementedError("__next__() is not implemented yet")
+        raise TypeError("AsyncFile is asynchronously iterable, use 'async for'")
 
     def __repr__(self) -> str:
         return f"<AsyncFile name={self._name!r} mode={self._mode!r} closed={self._closed}>"
@@ -203,6 +313,16 @@ class AsyncFile:
         running_loop = asyncio.get_running_loop()
         if running_loop is not self._loop:
             raise RuntimeError("AsyncFile is bound to a different event loop")
+
+    def _consume_from_read_buffer(self, size: int) -> bytes:
+        available = min(size, len(self._read_buffer))
+        if available <= 0:
+            return b""
+
+        data = bytes(self._read_buffer[:available])
+        del self._read_buffer[:available]
+        self._pos += available
+        return data
 
     async def _read_once(self, size: int, offset: int) -> bytes:
         fut = self._loop.create_future()
@@ -305,6 +425,62 @@ class AsyncFile:
 
         await fut
 
+    async def _truncate_once(self, size: int) -> None:
+        fut = self._loop.create_future()
+        req_ptr, req_addr = _alloc_fs_request()
+
+        def fs_callback(req_ptr):
+            req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
+            result = req_view.result
+
+            try:
+                if result < 0:
+                    if not fut.done():
+                        fut.set_exception(_error_from_result(result))
+                else:
+                    if not fut.done():
+                        fut.set_result(None)
+            finally:
+                _cleanup_fs_request(req_ptr)
+
+        cb = UV_FS_CB(fs_callback)
+        _set_request_callback(req_addr, cb)
+
+        result = uv.uv_fs_ftruncate(self._uv_loop, req_ptr, self._fd, size, cb)
+        if result < 0:
+            _cleanup_fs_request(req_ptr, req_addr)
+            raise _error_from_result(result)
+
+        await fut
+
+    async def _fsync_once(self) -> None:
+        fut = self._loop.create_future()
+        req_ptr, req_addr = _alloc_fs_request()
+
+        def fs_callback(req_ptr):
+            req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
+            result = req_view.result
+
+            try:
+                if result < 0:
+                    if not fut.done():
+                        fut.set_exception(_error_from_result(result))
+                else:
+                    if not fut.done():
+                        fut.set_result(None)
+            finally:
+                _cleanup_fs_request(req_ptr)
+
+        cb = UV_FS_CB(fs_callback)
+        _set_request_callback(req_addr, cb)
+
+        result = uv.uv_fs_fsync(self._uv_loop, req_ptr, self._fd, cb)
+        if result < 0:
+            _cleanup_fs_request(req_ptr, req_addr)
+            raise _error_from_result(result)
+
+        await fut
+
 
 # Define libuv structures and functions
 class uv_loop_t(Structure):
@@ -376,6 +552,23 @@ uv.uv_fs_close.argtypes = [
     c_void_p,
 ]
 uv.uv_fs_close.restype = c_int
+
+uv.uv_fs_ftruncate.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_int,
+    c_longlong,
+    c_void_p,
+]
+uv.uv_fs_ftruncate.restype = c_int
+
+uv.uv_fs_fsync.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_int,
+    c_void_p,
+]
+uv.uv_fs_fsync.restype = c_int
 
 uv.uv_fs_req_cleanup.argtypes = [POINTER(uv_fs_t)]
 uv.uv_fs_req_cleanup.restype = None
