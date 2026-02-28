@@ -299,6 +299,17 @@ async def test_open_default_mode_is_text(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_open_accepts_path_like(tmp_path):
+    path = tmp_path / "path_like.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    f = await uvfiles.open(path)
+    assert await f.read() == "hello"
+    assert f.name == str(path)
+    await f.close()
+
+
+@pytest.mark.asyncio
 async def test_open_int_flags_keeps_binary_behavior(tmp_path):
     path = tmp_path / "flags_binary.bin"
     path.write_bytes(b"\xe4\xb8\xad")

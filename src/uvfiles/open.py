@@ -93,7 +93,7 @@ def _parse_mode(mode: str) -> tuple[int, str, bool, bool]:
 
 
 def open(
-    path: str,
+    path: str | os.PathLike[str],
     mode_or_flags: str | int = "r",
     mode: int = 0o644,
     *,
@@ -103,8 +103,13 @@ def open(
     newline: Optional[str] = None,
     loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> asyncio.Future[AsyncFile]:
-    if not isinstance(path, str):
-        raise TypeError("path must be str")
+    try:
+        resolved_path = os.fspath(path)
+    except TypeError as exc:
+        raise TypeError("path must be str or os.PathLike[str]") from exc
+
+    if not isinstance(resolved_path, str):
+        raise TypeError("path must be str or os.PathLike[str]")
 
     if not isinstance(mode, int):
         raise TypeError("mode must be int")
@@ -155,7 +160,7 @@ def open(
                     fut.set_result(
                         AsyncFile(
                             result,
-                            path,
+                            resolved_path,
                             loop,
                             file_mode,
                             binary=binary,
@@ -172,7 +177,7 @@ def open(
     _set_request_callback(req_addr, cb)
 
     result = uv.uv_fs_open(
-        uv_loop, req_ptr, path.encode("utf-8"), flags, mode, cb
+        uv_loop, req_ptr, os.fsencode(resolved_path), flags, mode, cb
     )
 
     if result < 0:
