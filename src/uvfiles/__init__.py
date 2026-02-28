@@ -6,9 +6,11 @@ from ctypes import (
     c_char,
     c_int,
     c_char_p,
+    c_long,
     c_longlong,
     c_size_t,
     c_ssize_t,
+    c_uint64,
     c_uint,
     c_void_p,
     Structure,
@@ -95,23 +97,29 @@ class AsyncFile:
             raise ValueError("I/O operation on closed file")
         return self._fd
 
-    def readable(self) -> bool:
+    async def readable(self) -> bool:
         """Return True if the file is readable."""
+        self._ensure_open()
+        self._ensure_loop()
         return "r" in self._mode or "+" in self._mode
 
-    def writable(self) -> bool:
+    async def writable(self) -> bool:
         """Return True if the file is writable."""
+        self._ensure_open()
+        self._ensure_loop()
         return "w" in self._mode or "a" in self._mode or "+" in self._mode
 
-    def seekable(self) -> bool:
+    async def seekable(self) -> bool:
         """Return True if the file is seekable."""
         self._ensure_open()
+        self._ensure_loop()
         return True
 
-    def isatty(self) -> bool:
+    async def isatty(self) -> bool:
         """Return True if the file is connected to a TTY device."""
         self._ensure_open()
-        return os.isatty(self._fd)
+        self._ensure_loop()
+        return uv.uv_guess_handle(self._fd) == UV_TTY_HANDLE_TYPE
 
     async def read(self, size: int = -1) -> Any:
         """Read and return up to size bytes."""
@@ -214,16 +222,17 @@ class AsyncFile:
         byte_view[:size] = data
         return size
 
-    def seek(self, offset: int, whence: int = 0) -> int:
+    async def seek(self, offset: int, whence: int = 0) -> int:
         """Change the stream position."""
         self._ensure_open()
+        self._ensure_loop()
 
         if whence == os.SEEK_SET:
             new_pos = offset
         elif whence == os.SEEK_CUR:
             new_pos = self._pos + offset
         elif whence == os.SEEK_END:
-            new_pos = os.fstat(self._fd).st_size + offset
+            new_pos = await self._fstat_once() + offset
         else:
             raise ValueError("invalid whence")
 
@@ -234,9 +243,10 @@ class AsyncFile:
         self._reset_read_state()
         return self._pos
 
-    def tell(self) -> int:
+    async def tell(self) -> int:
         """Return the current stream position."""
         self._ensure_open()
+        self._ensure_loop()
         return self._pos
 
     async def truncate(self, size: Optional[int] = None) -> int:
@@ -694,6 +704,34 @@ class AsyncFile:
 
         await fut
 
+    async def _fstat_once(self) -> int:
+        fut = self._loop.create_future()
+        req_ptr, req_addr = _alloc_fs_request()
+
+        def fs_callback(req_ptr):
+            req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_stat_view_t)).contents
+            result = req_view.result
+
+            try:
+                if result < 0:
+                    if not fut.done():
+                        fut.set_exception(_error_from_result(result))
+                else:
+                    if not fut.done():
+                        fut.set_result(int(req_view.statbuf.st_size))
+            finally:
+                _cleanup_fs_request(req_ptr)
+
+        cb = UV_FS_CB(fs_callback)
+        _set_request_callback(req_addr, cb)
+
+        result = uv.uv_fs_fstat(self._uv_loop, req_ptr, self._fd, cb)
+        if result < 0:
+            _cleanup_fs_request(req_ptr, req_addr)
+            raise _error_from_result(result)
+
+        return await fut
+
 
 # Define libuv structures and functions
 class uv_loop_t(Structure):
@@ -711,6 +749,34 @@ class uv_buf_t(Structure):
     ]
 
 
+class uv_timespec_t(Structure):
+    _fields_ = [
+        ("tv_sec", c_long),
+        ("tv_nsec", c_long),
+    ]
+
+
+class uv_stat_t(Structure):
+    _fields_ = [
+        ("st_dev", c_uint64),
+        ("st_mode", c_uint64),
+        ("st_nlink", c_uint64),
+        ("st_uid", c_uint64),
+        ("st_gid", c_uint64),
+        ("st_rdev", c_uint64),
+        ("st_ino", c_uint64),
+        ("st_size", c_uint64),
+        ("st_blksize", c_uint64),
+        ("st_blocks", c_uint64),
+        ("st_flags", c_uint64),
+        ("st_gen", c_uint64),
+        ("st_atim", uv_timespec_t),
+        ("st_mtim", uv_timespec_t),
+        ("st_ctim", uv_timespec_t),
+        ("st_birthtim", uv_timespec_t),
+    ]
+
+
 class uv_fs_req_view_t(Structure):
     """Minimal prefix view to read public uv_fs_t result safely."""
 
@@ -722,6 +788,23 @@ class uv_fs_req_view_t(Structure):
         ("loop", c_void_p),  # uv_loop_t* loop
         ("cb", c_void_p),  # uv_fs_cb cb
         ("result", c_ssize_t),  # ssize_t result
+    ]
+
+
+class uv_fs_req_stat_view_t(Structure):
+    """uv_fs_t view that includes statbuf for uv_fs_fstat callbacks."""
+
+    _fields_ = [
+        ("data", c_void_p),  # void* data
+        ("type", c_int),  # uv_req_type
+        ("reserved", c_void_p * 6),  # void* reserved[6]
+        ("fs_type", c_int),  # uv_fs_type
+        ("loop", c_void_p),  # uv_loop_t* loop
+        ("cb", c_void_p),  # uv_fs_cb cb
+        ("result", c_ssize_t),  # ssize_t result
+        ("ptr", c_void_p),  # void* ptr
+        ("path", c_char_p),  # const char* path
+        ("statbuf", uv_stat_t),  # uv_stat_t statbuf
     ]
 
 
@@ -783,6 +866,14 @@ uv.uv_fs_fsync.argtypes = [
 ]
 uv.uv_fs_fsync.restype = c_int
 
+uv.uv_fs_fstat.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_int,
+    c_void_p,
+]
+uv.uv_fs_fstat.restype = c_int
+
 uv.uv_fs_req_cleanup.argtypes = [POINTER(uv_fs_t)]
 uv.uv_fs_req_cleanup.restype = None
 
@@ -792,9 +883,13 @@ uv.uv_req_size.restype = c_size_t
 uv.uv_strerror.argtypes = [c_int]
 uv.uv_strerror.restype = ctypes.c_char_p
 
+uv.uv_guess_handle.argtypes = [c_int]
+uv.uv_guess_handle.restype = c_int
+
 # Define callback type
 UV_FS_CB = CFUNCTYPE(None, POINTER(uv_fs_t))
 UV_FS_REQ_TYPE = 6
+UV_TTY_HANDLE_TYPE = 14
 
 # Set up the function signature for PyCapsule_GetPointer
 ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p

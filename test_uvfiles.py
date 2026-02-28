@@ -35,8 +35,8 @@ async def test_async_open_and_close(tmp_path):
     assert f.name == str(path)
     assert f.mode == "r"
     assert f.closed is False
-    assert f.readable() is True
-    assert f.writable() is False
+    assert await f.readable() is True
+    assert await f.writable() is False
 
     await f.close()
     assert f.closed is True
@@ -51,12 +51,12 @@ async def test_async_write_and_read_roundtrip(tmp_path):
 
     written = await f.write(b"abc\n123")
     assert written == 7
-    assert f.tell() == 7
+    assert await f.tell() == 7
 
-    assert f.seek(0) == 0
+    assert await f.seek(0) == 0
     content = await f.read()
     assert content == b"abc\n123"
-    assert f.tell() == 7
+    assert await f.tell() == 7
 
     await f.close()
 
@@ -68,11 +68,11 @@ async def test_read_with_size(tmp_path):
 
     f = await uvfiles.open(str(path), os.O_RDONLY)
     assert await f.read(3) == b"abc"
-    assert f.tell() == 3
+    assert await f.tell() == 3
     assert await f.read(2) == b"de"
-    assert f.tell() == 5
+    assert await f.tell() == 5
     assert await f.read(10) == b"f"
-    assert f.tell() == 6
+    assert await f.tell() == 6
 
     await f.close()
 
@@ -83,16 +83,16 @@ async def test_seek_tell_whence(tmp_path):
     path.write_bytes(b"0123456789")
 
     f = await uvfiles.open(str(path), os.O_RDONLY)
-    assert f.seek(2) == 2
-    assert f.tell() == 2
-    assert f.seek(3, os.SEEK_CUR) == 5
-    assert f.seek(-1, os.SEEK_END) == 9
-    assert f.tell() == 9
+    assert await f.seek(2) == 2
+    assert await f.tell() == 2
+    assert await f.seek(3, os.SEEK_CUR) == 5
+    assert await f.seek(-1, os.SEEK_END) == 9
+    assert await f.tell() == 9
 
     with pytest.raises(ValueError):
-        f.seek(-11, os.SEEK_END)
+        await f.seek(-11, os.SEEK_END)
     with pytest.raises(ValueError):
-        f.seek(0, 12345)
+        await f.seek(0, 12345)
 
     await f.close()
 
@@ -108,11 +108,17 @@ async def test_closed_file_operations(tmp_path):
     with pytest.raises(ValueError):
         f.fileno()
     with pytest.raises(ValueError):
-        f.seekable()
+        await f.readable()
     with pytest.raises(ValueError):
-        f.seek(0)
+        await f.writable()
     with pytest.raises(ValueError):
-        f.tell()
+        await f.seekable()
+    with pytest.raises(ValueError):
+        await f.isatty()
+    with pytest.raises(ValueError):
+        await f.seek(0)
+    with pytest.raises(ValueError):
+        await f.tell()
     with pytest.raises(ValueError):
         await f.read()
     with pytest.raises(ValueError):
@@ -137,10 +143,10 @@ async def test_async_truncate_default_size_uses_current_pos(tmp_path):
     f = await uvfiles.open(str(path), os.O_CREAT | os.O_RDWR | os.O_TRUNC)
 
     await f.write(b"abcdef")
-    f.seek(3)
+    await f.seek(3)
     assert await f.truncate() == 3
 
-    f.seek(0)
+    await f.seek(0)
     assert await f.read() == b"abc"
     await f.close()
 
@@ -151,11 +157,11 @@ async def test_async_truncate_explicit_size_and_seek_adjustment(tmp_path):
     f = await uvfiles.open(str(path), os.O_CREAT | os.O_RDWR | os.O_TRUNC)
 
     await f.write(b"0123456789")
-    f.seek(8)
+    await f.seek(8)
     assert await f.truncate(5) == 5
-    assert f.tell() == 5
+    assert await f.tell() == 5
 
-    f.seek(0)
+    await f.seek(0)
     assert await f.read() == b"01234"
     await f.close()
 
@@ -214,7 +220,7 @@ async def test_async_writelines_roundtrip(tmp_path):
     f = await uvfiles.open(str(path), os.O_CREAT | os.O_RDWR | os.O_TRUNC)
 
     await f.writelines([b"line1\n", b"line2\n"])
-    f.seek(0)
+    await f.seek(0)
     assert await f.read() == b"line1\nline2\n"
     await f.close()
 
@@ -275,7 +281,7 @@ async def test_open_mode_string_text_roundtrip(tmp_path):
     f = await uvfiles.open(str(path), "w+")
     written = await f.write("abc\n123")
     assert written == 7
-    f.seek(0)
+    await f.seek(0)
     assert await f.read() == "abc\n123"
     await f.close()
 
@@ -347,7 +353,7 @@ async def test_async_open_alias(tmp_path):
     path = tmp_path / "alias.txt"
     f = await uvfiles.async_open(str(path), "w+")
     await f.write("alias")
-    f.seek(0)
+    await f.seek(0)
     assert await f.read() == "alias"
     await f.close()
 
@@ -358,10 +364,10 @@ async def test_isatty_and_closed_behavior(tmp_path):
     path.write_text("x", encoding="utf-8")
 
     f = await uvfiles.open(str(path), "r")
-    assert f.isatty() is False
+    assert await f.isatty() is False
     await f.close()
     with pytest.raises(ValueError):
-        f.isatty()
+        await f.isatty()
 
 
 @pytest.mark.asyncio
