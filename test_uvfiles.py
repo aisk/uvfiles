@@ -773,14 +773,17 @@ async def test_os_sendfile(tmp_path):
 @pytest.mark.asyncio
 async def test_os_statvfs(tmp_path):
     st = await uvos.statvfs(tmp_path)
-    expected = os.statvfs(tmp_path)
 
+    # libuv's uv_fs_statfs and the platform's os.statvfs disagree on the meaning
+    # of some fields (e.g. f_bsize is the fundamental block size for libuv but the
+    # preferred I/O size on macOS), so sanity-check the values instead of
+    # comparing against os.statvfs.
     assert isinstance(st, os.statvfs_result)
-    assert st.f_bsize == expected.f_bsize
-    assert st.f_blocks == expected.f_blocks
-    # Free/available counts can drift between the two calls; just sanity-check.
-    assert st.f_bfree > 0
-    assert st.f_files == expected.f_files
+    assert st.f_bsize > 0
+    assert st.f_blocks > 0
+    assert st.f_bfree >= 0
+    assert st.f_bavail <= st.f_blocks
+    assert st.f_files > 0
 
 
 @pytest.mark.asyncio
