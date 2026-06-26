@@ -608,6 +608,78 @@ async def test_os_stat_missing_raises(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_os_listdir(tmp_path):
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("y", encoding="utf-8")
+    (tmp_path / "sub").mkdir()
+
+    names = await uvos.listdir(tmp_path)
+    assert sorted(names) == ["a.txt", "b.txt", "sub"]
+    assert sorted(names) == sorted(os.listdir(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_os_listdir_empty(tmp_path):
+    d = tmp_path / "empty"
+    d.mkdir()
+    assert await uvos.listdir(d) == []
+
+
+@pytest.mark.asyncio
+async def test_os_listdir_missing_raises(tmp_path):
+    with pytest.raises(OSError):
+        await uvos.listdir(tmp_path / "nope")
+
+
+@pytest.mark.asyncio
+async def test_os_scandir_entries(tmp_path):
+    f = tmp_path / "file.txt"
+    f.write_text("hello", encoding="utf-8")
+    d = tmp_path / "dir"
+    d.mkdir()
+
+    entries = await uvos.scandir(tmp_path)
+    by_name = {e.name: e for e in entries}
+    assert set(by_name) == {"file.txt", "dir"}
+
+    file_entry = by_name["file.txt"]
+    assert file_entry.is_file() is True
+    assert file_entry.is_dir() is False
+    assert file_entry.is_symlink() is False
+    assert file_entry.path == str(f)
+    assert os.fspath(file_entry) == str(f)
+    assert file_entry.stat().st_size == 5
+
+    dir_entry = by_name["dir"]
+    assert dir_entry.is_dir() is True
+    assert dir_entry.is_file() is False
+
+
+@pytest.mark.asyncio
+async def test_os_scandir_symlink(tmp_path):
+    target = tmp_path / "target_dir"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target)
+
+    entries = {e.name: e for e in await uvos.scandir(tmp_path)}
+    link_entry = entries["link"]
+
+    assert link_entry.is_symlink() is True
+    # follow_symlinks=True resolves to the directory; =False sees the link itself.
+    assert link_entry.is_dir() is True
+    assert link_entry.is_dir(follow_symlinks=False) is False
+
+
+@pytest.mark.asyncio
+async def test_os_scandir_context_manager(tmp_path):
+    (tmp_path / "x.txt").write_text("x", encoding="utf-8")
+
+    with await uvos.scandir(tmp_path) as entries:
+        assert [e.name for e in entries] == ["x.txt"]
+
+
+@pytest.mark.asyncio
 async def test_os_lstat_does_not_follow_symlink(tmp_path):
     target = tmp_path / "target.txt"
     target.write_bytes(b"data")

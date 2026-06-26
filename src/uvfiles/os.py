@@ -9,10 +9,15 @@ readlink, ...) need extra result views and are intentionally left out for now.
 import asyncio
 import ctypes
 import os
+import stat as _filestat
 from ctypes import POINTER
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 
 from .uv import (
+    UV_DIRENT_DIR,
+    UV_DIRENT_FILE,
+    UV_DIRENT_LINK,
+    UV_DIRENT_UNKNOWN,
     UV_FS_CB,
     _alloc_fs_request,
     _cleanup_fs_request,
@@ -20,6 +25,7 @@ from .uv import (
     _get_uv_loop_ptr,
     _set_request_callback,
     uv,
+    uv_dirent_t,
     uv_fs_req_stat_view_t,
     uv_fs_req_view_t,
     uv_stat_t,
@@ -27,7 +33,19 @@ from .uv import (
 
 StrPath = Union[str, "os.PathLike[str]"]
 
-__all__ = ["remove", "unlink", "rename", "mkdir", "rmdir", "stat", "lstat", "path"]
+__all__ = [
+    "remove",
+    "unlink",
+    "rename",
+    "mkdir",
+    "rmdir",
+    "stat",
+    "lstat",
+    "listdir",
+    "scandir",
+    "DirEntry",
+    "path",
+]
 
 
 def _fsencode(path: StrPath) -> bytes:
@@ -156,6 +174,138 @@ async def lstat(path: StrPath) -> os.stat_result:
     encoded = _fsencode(path)
     return await _run_fs(
         lambda loop, req, cb: uv.uv_fs_lstat(loop, req, encoded, cb), _on_stat
+    )
+
+
+class DirEntry:
+    """Lightweight ``os.DirEntry``-compatible entry produced by :func:`scandir`.
+
+    The file type cached from the directory read answers ``is_dir`` / ``is_file``
+    / ``is_symlink`` without a syscall in the common case. When the type is
+    unknown, or a symlink must be resolved with ``follow_symlinks=True``, it falls
+    back to a synchronous ``os.stat`` / ``os.lstat`` -- exactly like
+    ``os.DirEntry``, whose methods (and ``stat``) are likewise synchronous for
+    drop-in compatibility.
+    """
+
+    __slots__ = ("name", "path", "_d_type", "_stat_cache", "_lstat_cache")
+
+    def __init__(self, name: str, entry_path: str, d_type: int) -> None:
+        self.name = name
+        self.path = entry_path
+        self._d_type = d_type
+        self._stat_cache: Optional[os.stat_result] = None
+        self._lstat_cache: Optional[os.stat_result] = None
+
+    def __fspath__(self) -> str:
+        return self.path
+
+    def __repr__(self) -> str:
+        return f"<DirEntry {self.name!r}>"
+
+    def inode(self) -> int:
+        return self._get_lstat().st_ino
+
+    def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+        return self._get_stat() if follow_symlinks else self._get_lstat()
+
+    def is_symlink(self) -> bool:
+        if self._d_type == UV_DIRENT_LINK:
+            return True
+        if self._d_type != UV_DIRENT_UNKNOWN:
+            return False
+        try:
+            return _filestat.S_ISLNK(self._get_lstat().st_mode)
+        except OSError:
+            return False
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        return self._is_type(_filestat.S_ISDIR, UV_DIRENT_DIR, follow_symlinks)
+
+    def is_file(self, *, follow_symlinks: bool = True) -> bool:
+        return self._is_type(_filestat.S_ISREG, UV_DIRENT_FILE, follow_symlinks)
+
+    def _is_type(
+        self, st_check: Callable[[int], bool], dirent_type: int, follow_symlinks: bool
+    ) -> bool:
+        if self._d_type == dirent_type:
+            return True
+        # A definitive non-matching type (and not a symlink to resolve) is final.
+        if self._d_type not in (UV_DIRENT_UNKNOWN, UV_DIRENT_LINK):
+            return False
+        try:
+            target = self._get_stat() if follow_symlinks else self._get_lstat()
+        except OSError:
+            return False
+        return st_check(target.st_mode)
+
+    def _get_stat(self) -> os.stat_result:
+        if self._stat_cache is None:
+            self._stat_cache = os.stat(self.path)
+        return self._stat_cache
+
+    def _get_lstat(self) -> os.stat_result:
+        if self._lstat_cache is None:
+            self._lstat_cache = os.lstat(self.path)
+        return self._lstat_cache
+
+
+class ScandirResult(List[DirEntry]):
+    """List of :class:`DirEntry` that is also a (no-op) context manager.
+
+    libuv reads the whole directory eagerly, so unlike ``os.scandir`` there is no
+    open handle to close; ``close`` / ``with`` / ``async with`` exist only for
+    drop-in compatibility.
+    """
+
+    def __enter__(self) -> "ScandirResult":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+    async def __aenter__(self) -> "ScandirResult":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+    def close(self) -> None:
+        pass
+
+
+def _iter_dirents(req_ptr: Any) -> Any:
+    ent = uv_dirent_t()
+    while uv.uv_fs_scandir_next(req_ptr, ctypes.byref(ent)) == 0:
+        yield os.fsdecode(ent.name), int(ent.type)
+
+
+async def listdir(path: StrPath = ".") -> List[str]:
+    """Return a list of the entry names in directory ``path``.
+
+    Excludes the ``.`` and ``..`` entries, matching ``os.listdir``.
+    """
+    encoded = _fsencode(path)
+    return await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_scandir(loop, req, encoded, 0, cb),
+        lambda req_ptr: [name for name, _type in _iter_dirents(req_ptr)],
+    )
+
+
+async def scandir(path: StrPath = ".") -> ScandirResult:
+    """Return :class:`DirEntry` objects for the entries in directory ``path``."""
+    base = os.fspath(path)
+    encoded = _fsencode(base)
+
+    def on_scandir(req_ptr: Any) -> ScandirResult:
+        result = ScandirResult()
+        for name, d_type in _iter_dirents(req_ptr):
+            result.append(DirEntry(name, os.path.join(base, name), d_type))
+        return result
+
+    return await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_scandir(loop, req, encoded, 0, cb),
+        on_scandir,
     )
 
 
