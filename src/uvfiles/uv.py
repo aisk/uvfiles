@@ -105,6 +105,21 @@ class uv_fs_req_stat_view_t(Structure):
     ]
 
 
+class uv_fs_req_ptr_view_t(Structure):
+    """uv_fs_t view that includes the ``ptr`` field (e.g. readlink/realpath result)."""
+
+    _fields_ = [
+        ("data", c_void_p),  # void* data
+        ("type", c_int),  # uv_req_type
+        ("reserved", c_void_p * 6),  # void* reserved[6]
+        ("fs_type", c_int),  # uv_fs_type
+        ("loop", c_void_p),  # uv_loop_t* loop
+        ("cb", c_void_p),  # uv_fs_cb cb
+        ("result", c_ssize_t),  # ssize_t result
+        ("ptr", c_void_p),  # void* ptr
+    ]
+
+
 uv.uv_fs_open.argtypes = [
     POINTER(uv_loop_t),
     POINTER(uv_fs_t),
@@ -234,6 +249,42 @@ uv.uv_fs_scandir_next.argtypes = [
     POINTER(uv_dirent_t),
 ]
 uv.uv_fs_scandir_next.restype = c_int
+
+uv.uv_fs_access.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_int,
+    c_void_p,
+]
+uv.uv_fs_access.restype = c_int
+
+uv.uv_fs_link.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_char_p,
+    c_void_p,
+]
+uv.uv_fs_link.restype = c_int
+
+uv.uv_fs_symlink.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_char_p,
+    c_int,
+    c_void_p,
+]
+uv.uv_fs_symlink.restype = c_int
+
+uv.uv_fs_readlink.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_void_p,
+]
+uv.uv_fs_readlink.restype = c_int
 
 uv.uv_fs_req_cleanup.argtypes = [POINTER(uv_fs_t)]
 uv.uv_fs_req_cleanup.restype = None

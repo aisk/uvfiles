@@ -139,6 +139,32 @@ class AsyncFile:
             return await self._read_binary(size)
         return await self._read_text(size)
 
+    async def readall(self) -> Any:
+        """Read and return all remaining data until EOF."""
+        return await self.read(-1)
+
+    async def read1(self, size: int = -1) -> bytes:
+        """Read and return up to size bytes with at most one underlying read."""
+        self._ensure_open()
+        self._ensure_loop()
+        if not self._binary:
+            raise TypeError("read1() is only supported in binary mode")
+        async with self._lock:
+            return await self._read1_locked(size)
+
+    async def _read1_locked(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b""
+
+        if self._read_buffer:
+            take = len(self._read_buffer) if size < 0 else size
+            return self._consume_from_read_buffer(take)
+
+        read_size = size if size > 0 else 64 * 1024
+        data = await self._read_once(read_size, self._pos)
+        self._pos += len(data)
+        return data
+
     async def readline(self, size: int = -1) -> Any:
         """Read and return one line from the file."""
         self._ensure_open()
