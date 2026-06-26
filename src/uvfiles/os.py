@@ -26,6 +26,7 @@ from .uv import (
     _set_request_callback,
     uv,
     uv_dirent_t,
+    uv_fs_req_ptr_view_t,
     uv_fs_req_stat_view_t,
     uv_fs_req_view_t,
     uv_stat_t,
@@ -37,12 +38,21 @@ __all__ = [
     "remove",
     "unlink",
     "rename",
+    "replace",
+    "renames",
     "mkdir",
+    "makedirs",
     "rmdir",
+    "removedirs",
     "stat",
     "lstat",
+    "access",
+    "link",
+    "symlink",
+    "readlink",
     "listdir",
     "scandir",
+    "getcwd",
     "DirEntry",
     "path",
 ]
@@ -55,13 +65,17 @@ def _fsencode(path: StrPath) -> bytes:
 async def _run_fs(
     call: Callable[[Any, Any, Any], int],
     on_success: Optional[Callable[[Any], Any]] = None,
+    *,
+    raise_on_error: bool = True,
 ) -> Any:
     """Run a single libuv fs op on the running loop and await its result.
 
     ``call`` receives ``(uv_loop, req_ptr, cb)`` and must invoke the matching
     ``uv_fs_*`` function. ``on_success`` is called with the raw request pointer
     when ``result >= 0`` to build the value the coroutine resolves to; when it is
-    ``None`` the coroutine resolves to ``None``. Follows the same lifetime rules
+    ``None`` the coroutine resolves to ``None``. When ``raise_on_error`` is False
+    a negative ``result`` resolves to that integer instead of raising (used by
+    ``access``, which reports failure as a bool). Follows the same lifetime rules
     as the ``_*_once`` helpers in async_file.py.
     """
     loop = asyncio.get_running_loop()
@@ -77,7 +91,10 @@ async def _run_fs(
         try:
             if result < 0:
                 if not fut.done():
-                    fut.set_exception(_error_from_result(result))
+                    if raise_on_error:
+                        fut.set_exception(_error_from_result(result))
+                    else:
+                        fut.set_result(int(result))
             else:
                 value = None if on_success is None else on_success(req_ptr)
                 if not fut.done():
@@ -91,7 +108,9 @@ async def _run_fs(
     result = call(uv_loop, req_ptr, cb)
     if result < 0:
         _cleanup_fs_request(req_ptr, req_addr)
-        raise _error_from_result(result)
+        if raise_on_error:
+            raise _error_from_result(result)
+        return int(result)
 
     return await fut
 
@@ -175,6 +194,73 @@ async def lstat(path: StrPath) -> os.stat_result:
     return await _run_fs(
         lambda loop, req, cb: uv.uv_fs_lstat(loop, req, encoded, cb), _on_stat
     )
+
+
+async def access(path: StrPath, mode: int) -> bool:
+    """Return True if the calling user can access ``path`` with the given mode."""
+    encoded = _fsencode(path)
+    result = await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_access(loop, req, encoded, mode, cb),
+        lambda req_ptr: True,
+        raise_on_error=False,
+    )
+    return result is True
+
+
+async def link(src: StrPath, dst: StrPath) -> None:
+    """Create a hard link ``dst`` pointing to ``src``."""
+    src_encoded = _fsencode(src)
+    dst_encoded = _fsencode(dst)
+    await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_link(loop, req, src_encoded, dst_encoded, cb)
+    )
+
+
+async def symlink(
+    src: StrPath, dst: StrPath, target_is_directory: bool = False
+) -> None:
+    """Create a symbolic link ``dst`` pointing to ``src``.
+
+    ``target_is_directory`` is accepted for ``os.symlink`` compatibility and only
+    has an effect on Windows, which uvloop does not support.
+    """
+    src_encoded = _fsencode(src)
+    dst_encoded = _fsencode(dst)
+    await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_symlink(
+            loop, req, src_encoded, dst_encoded, 0, cb
+        )
+    )
+
+
+def _on_readlink(req_ptr: Any) -> str:
+    view = ctypes.cast(req_ptr, POINTER(uv_fs_req_ptr_view_t)).contents
+    if not view.ptr:
+        return ""
+    target = ctypes.cast(view.ptr, ctypes.c_char_p).value
+    return os.fsdecode(target) if target is not None else ""
+
+
+async def readlink(path: StrPath) -> str:
+    """Return the path the symbolic link ``path`` points to."""
+    encoded = _fsencode(path)
+    return await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_readlink(loop, req, encoded, cb), _on_readlink
+    )
+
+
+async def replace(src: StrPath, dst: StrPath) -> None:
+    """Rename ``src`` to ``dst``, atomically replacing an existing ``dst``."""
+    # POSIX rename(2) -- which uv_fs_rename wraps -- already overwrites the
+    # destination, so this matches os.replace semantics on the platforms uvloop
+    # supports.
+    await rename(src, dst)
+
+
+async def getcwd() -> str:
+    """Return the current working directory."""
+    # Pure metadata lookup with no blocking I/O; no libuv request needed.
+    return os.getcwd()
 
 
 class DirEntry:
@@ -307,6 +393,59 @@ async def scandir(path: StrPath = ".") -> ScandirResult:
         lambda loop, req, cb: uv.uv_fs_scandir(loop, req, encoded, 0, cb),
         on_scandir,
     )
+
+
+async def makedirs(
+    name: StrPath, mode: int = 0o777, exist_ok: bool = False
+) -> None:
+    """Recursive directory creation, like ``os.makedirs``."""
+    name = os.fspath(name)
+    head, tail = os.path.split(name)
+    if not tail:
+        head, tail = os.path.split(head)
+    if head and tail and not await path.exists(head):
+        try:
+            await makedirs(head, mode, exist_ok=exist_ok)
+        except FileExistsError:
+            pass
+        if tail == os.curdir:
+            return
+    try:
+        await mkdir(name, mode)
+    except OSError:
+        if not exist_ok or not await path.isdir(name):
+            raise
+
+
+async def removedirs(name: StrPath) -> None:
+    """Remove ``name`` then prune now-empty parent directories, like os.removedirs."""
+    name = os.fspath(name)
+    await rmdir(name)
+    head, tail = os.path.split(name)
+    if not tail:
+        head, tail = os.path.split(head)
+    while head and tail:
+        try:
+            await rmdir(head)
+        except OSError:
+            break
+        head, tail = os.path.split(head)
+
+
+async def renames(old: StrPath, new: StrPath) -> None:
+    """Recursive rename: create missing parents of ``new``, then prune ``old``'s."""
+    old = os.fspath(old)
+    new = os.fspath(new)
+    head, tail = os.path.split(new)
+    if head and tail and not await path.exists(head):
+        await makedirs(head)
+    await rename(old, new)
+    head, tail = os.path.split(old)
+    if head and tail:
+        try:
+            await removedirs(head)
+        except OSError:
+            pass
 
 
 # Imported last so uvfiles.os.stat / lstat are already defined when ospath binds

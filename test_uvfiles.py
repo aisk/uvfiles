@@ -587,6 +587,126 @@ async def test_ospath_abspath():
 
 
 @pytest.mark.asyncio
+async def test_os_access(tmp_path):
+    f = tmp_path / "f.txt"
+    f.write_text("x", encoding="utf-8")
+
+    assert await uvos.access(f, os.F_OK) is True
+    assert await uvos.access(f, os.R_OK) is True
+    assert await uvos.access(tmp_path / "nope", os.F_OK) is False
+
+
+@pytest.mark.asyncio
+async def test_os_link(tmp_path):
+    src = tmp_path / "src.txt"
+    src.write_text("data", encoding="utf-8")
+    dst = tmp_path / "hardlink.txt"
+
+    await uvos.link(src, dst)
+    assert dst.read_text(encoding="utf-8") == "data"
+    assert src.stat().st_ino == dst.stat().st_ino
+
+
+@pytest.mark.asyncio
+async def test_os_symlink_and_readlink(tmp_path):
+    target = tmp_path / "target.txt"
+    target.write_text("data", encoding="utf-8")
+    link = tmp_path / "link.txt"
+
+    await uvos.symlink(target, link)
+    assert link.is_symlink()
+    assert link.read_text(encoding="utf-8") == "data"
+
+    assert await uvos.readlink(link) == str(target)
+
+
+@pytest.mark.asyncio
+async def test_os_replace_overwrites(tmp_path):
+    src = tmp_path / "src.txt"
+    src.write_text("new", encoding="utf-8")
+    dst = tmp_path / "dst.txt"
+    dst.write_text("old", encoding="utf-8")
+
+    await uvos.replace(src, dst)
+    assert not src.exists()
+    assert dst.read_text(encoding="utf-8") == "new"
+
+
+@pytest.mark.asyncio
+async def test_os_makedirs_and_removedirs(tmp_path):
+    nested = tmp_path / "a" / "b" / "c"
+
+    await uvos.makedirs(nested)
+    assert nested.is_dir()
+
+    # exist_ok behavior
+    with pytest.raises(OSError):
+        await uvos.makedirs(nested)
+    await uvos.makedirs(nested, exist_ok=True)
+
+    await uvos.removedirs(nested)
+    assert not (tmp_path / "a").exists()
+
+
+@pytest.mark.asyncio
+async def test_os_renames(tmp_path):
+    src = tmp_path / "old" / "file.txt"
+    src.parent.mkdir()
+    src.write_text("data", encoding="utf-8")
+    dst = tmp_path / "new" / "sub" / "file.txt"
+
+    await uvos.renames(src, dst)
+    assert dst.read_text(encoding="utf-8") == "data"
+    # The now-empty source tree is pruned.
+    assert not (tmp_path / "old").exists()
+
+
+@pytest.mark.asyncio
+async def test_os_getcwd():
+    assert await uvos.getcwd() == os.getcwd()
+
+
+@pytest.mark.asyncio
+async def test_readall(tmp_path):
+    path = tmp_path / "readall.bin"
+    path.write_bytes(b"0123456789")
+
+    f = await uvfiles.open(str(path), os.O_RDONLY)
+    try:
+        assert await f.read(3) == b"012"
+        assert await f.readall() == b"3456789"
+    finally:
+        await f.close()
+
+
+@pytest.mark.asyncio
+async def test_read1_single_chunk(tmp_path):
+    path = tmp_path / "read1.bin"
+    path.write_bytes(b"abcdef")
+
+    f = await uvfiles.open(str(path), os.O_RDONLY)
+    try:
+        chunk = await f.read1(3)
+        assert chunk == b"abc"
+        assert await f.tell() == 3
+    finally:
+        await f.close()
+
+
+@pytest.mark.asyncio
+async def test_read1_text_mode_rejected(tmp_path):
+    path = tmp_path / "read1_text.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    f = await uvfiles.open(str(path), "r")
+    try:
+        with pytest.raises(TypeError):
+            await f.read1(3)
+    finally:
+        await f.close()
+
+
+@pytest.mark.asyncio
 async def test_os_stat_matches_stdlib(tmp_path):
     path = tmp_path / "stat_me.txt"
     path.write_bytes(b"hello world")
