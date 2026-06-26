@@ -1,15 +1,37 @@
 [project]
 name = "uvfiles"
 version = "0.1.0"
-description = "Add your description here"
+description = "Async file I/O backed by libuv (io_uring on Linux) with an aiofiles-compatible API."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "AN Long", email = "aisk1988@gmail.com" }
 ]
 requires-python = ">=3.10"
-dependencies = [
-    "uvloop",
+keywords = ["async", "asyncio", "libuv", "uvloop", "io_uring", "file", "aiofiles"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Filesystems",
+    "Typing :: Typed",
 ]
+dependencies = [
+    "uvloop>=0.21.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/aisk/uvfiles"
+Repository = "https://github.com/aisk/uvfiles"
+Issues = "https://github.com/aisk/uvfiles/issues"
 
 [tool.pyrefly]
 project-includes = ["**/*"]
@@ -27,4 +49,5 @@ build-backend = "uv_build"
 dev = [
     "pytest>=8.4.2",
     "pytest-asyncio>=1.1.0",
+    "pyrefly",
 ]
