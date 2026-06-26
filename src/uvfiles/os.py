@@ -88,10 +88,9 @@ async def _run_fs(
     req_ptr, req_addr = _alloc_fs_request()
 
     def fs_callback(req_ptr: Any) -> None:
-        req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
-        result = req_view.result
-
         try:
+            req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
+            result = req_view.result
             if result < 0:
                 if not fut.done():
                     if raise_on_error:
@@ -102,6 +101,12 @@ async def _run_fs(
                 value = None if on_success is None else on_success(req_ptr)
                 if not fut.done():
                     fut.set_result(value)
+        except BaseException as exc:
+            # An exception escaping a ctypes callback would otherwise be swallowed,
+            # leaving the future unresolved and the awaiter hung forever. Surface
+            # it to the caller instead.
+            if not fut.done():
+                fut.set_exception(exc)
         finally:
             _cleanup_fs_request(req_ptr)
 
@@ -142,9 +147,14 @@ def _build_stat_result(statbuf: uv_stat_t) -> os.stat_result:
         "st_blksize": int(statbuf.st_blksize),
         "st_blocks": int(statbuf.st_blocks),
         "st_rdev": int(statbuf.st_rdev),
-        "st_birthtime": statbuf.st_birthtim.tv_sec
-        + statbuf.st_birthtim.tv_nsec / 1e9,
     }
+    # st_birthtime only exists in os.stat_result on platforms that support it
+    # (macOS/BSD, not Linux). Python 3.13 made the dict argument strict, so
+    # passing an unsupported field name raises TypeError there.
+    if hasattr(os.stat_result, "st_birthtime"):
+        extra["st_birthtime"] = (
+            statbuf.st_birthtim.tv_sec + statbuf.st_birthtim.tv_nsec / 1e9
+        )
     return os.stat_result(values, extra)
 
 
