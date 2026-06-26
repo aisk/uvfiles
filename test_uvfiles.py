@@ -416,6 +416,44 @@ def test_open_buffering_not_supported(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_reads_do_not_corrupt_position(tmp_path):
+    path = tmp_path / "concurrent_read.bin"
+    payload = bytes(range(256)) * 64  # 16 KiB, larger than a single uv read chunk
+    path.write_bytes(payload)
+
+    f = await uvfiles.open(str(path), os.O_RDONLY)
+    try:
+        # Two full reads issued concurrently on the same file object. The lock
+        # serializes them, so each must observe a consistent cursor: one returns
+        # the whole file, the other (running after) sees EOF.
+        first, second = await asyncio.gather(f.read(), f.read())
+    finally:
+        await f.close()
+
+    assert {len(first), len(second)} == {len(payload), 0}
+    full = first if first else second
+    assert full == payload
+
+
+@pytest.mark.asyncio
+async def test_concurrent_writes_are_serialized(tmp_path):
+    path = tmp_path / "concurrent_write.bin"
+    f = await uvfiles.open(str(path), os.O_CREAT | os.O_RDWR | os.O_TRUNC)
+    try:
+        chunk_a = b"a" * 4096
+        chunk_b = b"b" * 4096
+        await asyncio.gather(f.write(chunk_a), f.write(chunk_b))
+        await f.seek(0)
+        content = await f.read()
+    finally:
+        await f.close()
+
+    # Serialized writes never interleave, so the file is one chunk followed by
+    # the other with no overlap or lost bytes.
+    assert content in (chunk_a + chunk_b, chunk_b + chunk_a)
+
+
+@pytest.mark.asyncio
 async def test_os_remove(tmp_path):
     path = tmp_path / "remove_me.txt"
     path.write_text("x", encoding="utf-8")
