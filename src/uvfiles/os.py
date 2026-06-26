@@ -27,7 +27,7 @@ from .uv import (
 
 StrPath = Union[str, "os.PathLike[str]"]
 
-__all__ = ["remove", "unlink", "rename", "mkdir", "rmdir", "stat", "lstat"]
+__all__ = ["remove", "unlink", "rename", "mkdir", "rmdir", "stat", "lstat", "path"]
 
 
 def _fsencode(path: StrPath) -> bytes:
@@ -157,3 +157,8 @@ async def lstat(path: StrPath) -> os.stat_result:
     return await _run_fs(
         lambda loop, req, cb: uv.uv_fs_lstat(loop, req, encoded, cb), _on_stat
     )
+
+
+# Imported last so uvfiles.os.stat / lstat are already defined when ospath binds
+# them, avoiding a circular import. Exposes uvfiles.os.path like aiofiles.os.path.
+from . import ospath as path  # noqa: E402
