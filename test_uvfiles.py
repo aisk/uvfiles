@@ -2,11 +2,13 @@
 
 import asyncio
 import os
+import stat as stat_module
 
 import pytest
 
 import uvloop
 import uvfiles
+import uvfiles.os as uvos
 from uvfiles import AsyncFile
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -411,3 +413,95 @@ def test_open_buffering_not_supported(tmp_path):
 
     with pytest.raises(NotImplementedError):
         uvfiles.open(str(path), "r", buffering=1)
+
+
+@pytest.mark.asyncio
+async def test_os_remove(tmp_path):
+    path = tmp_path / "remove_me.txt"
+    path.write_text("x", encoding="utf-8")
+
+    await uvos.remove(path)
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_os_remove_missing_raises(tmp_path):
+    with pytest.raises(OSError):
+        await uvos.remove(tmp_path / "does_not_exist")
+
+
+@pytest.mark.asyncio
+async def test_os_unlink_is_remove_alias(tmp_path):
+    path = tmp_path / "unlink_me.txt"
+    path.write_text("x", encoding="utf-8")
+
+    assert uvos.unlink is uvos.remove
+    await uvos.unlink(path)
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_os_rename(tmp_path):
+    src = tmp_path / "src.txt"
+    dst = tmp_path / "dst.txt"
+    src.write_text("data", encoding="utf-8")
+
+    await uvos.rename(src, dst)
+    assert not src.exists()
+    assert dst.read_text(encoding="utf-8") == "data"
+
+
+@pytest.mark.asyncio
+async def test_os_mkdir_and_rmdir(tmp_path):
+    d = tmp_path / "sub"
+
+    await uvos.mkdir(d)
+    assert d.is_dir()
+
+    await uvos.rmdir(d)
+    assert not d.exists()
+
+
+@pytest.mark.asyncio
+async def test_os_mkdir_existing_raises(tmp_path):
+    d = tmp_path / "exists"
+    d.mkdir()
+
+    with pytest.raises(OSError):
+        await uvos.mkdir(d)
+
+
+@pytest.mark.asyncio
+async def test_os_stat_matches_stdlib(tmp_path):
+    path = tmp_path / "stat_me.txt"
+    path.write_bytes(b"hello world")
+
+    st = await uvos.stat(path)
+    expected = os.stat(path)
+
+    assert isinstance(st, os.stat_result)
+    assert st.st_size == 11 == expected.st_size
+    assert st.st_mode == expected.st_mode
+    assert st.st_ino == expected.st_ino
+    assert st.st_mtime_ns == expected.st_mtime_ns
+
+
+@pytest.mark.asyncio
+async def test_os_stat_missing_raises(tmp_path):
+    with pytest.raises(OSError):
+        await uvos.stat(tmp_path / "nope")
+
+
+@pytest.mark.asyncio
+async def test_os_lstat_does_not_follow_symlink(tmp_path):
+    target = tmp_path / "target.txt"
+    target.write_bytes(b"data")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+
+    link_stat = await uvos.lstat(link)
+    target_stat = await uvos.stat(link)
+
+    assert stat_module.S_ISLNK(link_stat.st_mode)
+    assert not stat_module.S_ISLNK(target_stat.st_mode)
+    assert target_stat.st_size == 4

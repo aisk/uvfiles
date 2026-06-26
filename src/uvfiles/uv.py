@@ -163,6 +163,56 @@ uv.uv_fs_fstat.argtypes = [
 ]
 uv.uv_fs_fstat.restype = c_int
 
+uv.uv_fs_unlink.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_void_p,
+]
+uv.uv_fs_unlink.restype = c_int
+
+uv.uv_fs_rename.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_char_p,
+    c_void_p,
+]
+uv.uv_fs_rename.restype = c_int
+
+uv.uv_fs_mkdir.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_int,
+    c_void_p,
+]
+uv.uv_fs_mkdir.restype = c_int
+
+uv.uv_fs_rmdir.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_void_p,
+]
+uv.uv_fs_rmdir.restype = c_int
+
+uv.uv_fs_stat.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_void_p,
+]
+uv.uv_fs_stat.restype = c_int
+
+uv.uv_fs_lstat.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_void_p,
+]
+uv.uv_fs_lstat.restype = c_int
+
 uv.uv_fs_req_cleanup.argtypes = [POINTER(uv_fs_t)]
 uv.uv_fs_req_cleanup.restype = None
 
