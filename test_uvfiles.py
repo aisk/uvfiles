@@ -747,6 +747,49 @@ async def test_os_getcwd():
 
 
 @pytest.mark.asyncio
+async def test_os_sendfile(tmp_path):
+    src = tmp_path / "src.bin"
+    payload = bytes(range(256)) * 16  # 4 KiB
+    src.write_bytes(payload)
+    dst = tmp_path / "dst.bin"
+
+    in_fd = os.open(src, os.O_RDONLY)
+    out_fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        total = 0
+        while total < len(payload):
+            sent = await uvos.sendfile(out_fd, in_fd, total, len(payload) - total)
+            if sent == 0:
+                break
+            total += sent
+    finally:
+        os.close(in_fd)
+        os.close(out_fd)
+
+    assert total == len(payload)
+    assert dst.read_bytes() == payload
+
+
+@pytest.mark.asyncio
+async def test_os_statvfs(tmp_path):
+    st = await uvos.statvfs(tmp_path)
+    expected = os.statvfs(tmp_path)
+
+    assert isinstance(st, os.statvfs_result)
+    assert st.f_bsize == expected.f_bsize
+    assert st.f_blocks == expected.f_blocks
+    # Free/available counts can drift between the two calls; just sanity-check.
+    assert st.f_bfree > 0
+    assert st.f_files == expected.f_files
+
+
+@pytest.mark.asyncio
+async def test_os_statvfs_missing_raises(tmp_path):
+    with pytest.raises(OSError):
+        await uvos.statvfs(tmp_path / "nope")
+
+
+@pytest.mark.asyncio
 async def test_readall(tmp_path):
     path = tmp_path / "readall.bin"
     path.write_bytes(b"0123456789")

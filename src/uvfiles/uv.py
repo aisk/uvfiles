@@ -74,6 +74,19 @@ class uv_stat_t(Structure):
     ]
 
 
+class uv_statfs_t(Structure):
+    _fields_ = [
+        ("f_type", c_uint64),
+        ("f_bsize", c_uint64),
+        ("f_blocks", c_uint64),
+        ("f_bfree", c_uint64),
+        ("f_bavail", c_uint64),
+        ("f_files", c_uint64),
+        ("f_ffree", c_uint64),
+        ("f_spare", c_uint64 * 4),
+    ]
+
+
 class uv_fs_req_view_t(Structure):
     """Minimal prefix view to read public uv_fs_t result safely."""
 
@@ -285,6 +298,25 @@ uv.uv_fs_readlink.argtypes = [
     c_void_p,
 ]
 uv.uv_fs_readlink.restype = c_int
+
+uv.uv_fs_sendfile.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_int,
+    c_int,
+    c_longlong,
+    c_size_t,
+    c_void_p,
+]
+uv.uv_fs_sendfile.restype = c_int
+
+uv.uv_fs_statfs.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_void_p,
+]
+uv.uv_fs_statfs.restype = c_int
 
 uv.uv_fs_req_cleanup.argtypes = [POINTER(uv_fs_t)]
 uv.uv_fs_req_cleanup.restype = None

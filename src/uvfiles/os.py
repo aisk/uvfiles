@@ -30,6 +30,7 @@ from .uv import (
     uv_fs_req_stat_view_t,
     uv_fs_req_view_t,
     uv_stat_t,
+    uv_statfs_t,
 )
 
 StrPath = Union[str, "os.PathLike[str]"]
@@ -52,6 +53,8 @@ __all__ = [
     "readlink",
     "listdir",
     "scandir",
+    "sendfile",
+    "statvfs",
     "getcwd",
     "DirEntry",
     "path",
@@ -261,6 +264,63 @@ async def getcwd() -> str:
     """Return the current working directory."""
     # Pure metadata lookup with no blocking I/O; no libuv request needed.
     return os.getcwd()
+
+
+def _on_sendfile(req_ptr: Any) -> int:
+    view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
+    return int(view.result)
+
+
+async def sendfile(out_fd: int, in_fd: int, offset: int, count: int) -> int:
+    """Copy ``count`` bytes from ``in_fd`` (at ``offset``) to ``out_fd``.
+
+    Returns the number of bytes transferred, like ``os.sendfile``.
+    """
+    return await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_sendfile(
+            loop, req, out_fd, in_fd, offset, count, cb
+        ),
+        _on_sendfile,
+    )
+
+
+def _on_statvfs(req_ptr: Any) -> os.statvfs_result:
+    view = ctypes.cast(req_ptr, POINTER(uv_fs_req_ptr_view_t)).contents
+    if not view.ptr:
+        raise OSError("statfs returned no data")
+    s = ctypes.cast(view.ptr, POINTER(uv_statfs_t)).contents
+
+    f_bsize = int(s.f_bsize)
+    # libuv's uv_statfs_t is a reduced set: it has no fragment size, separate
+    # non-root inode count, mount flags, or name length limit. Approximate
+    # f_frsize with the block size and f_favail with f_ffree; report f_flag and
+    # f_namemax as 0 (unavailable).
+    values = (
+        f_bsize,  # f_bsize
+        f_bsize,  # f_frsize
+        int(s.f_blocks),  # f_blocks
+        int(s.f_bfree),  # f_bfree
+        int(s.f_bavail),  # f_bavail
+        int(s.f_files),  # f_files
+        int(s.f_ffree),  # f_ffree
+        int(s.f_ffree),  # f_favail
+        0,  # f_flag
+        0,  # f_namemax
+    )
+    return os.statvfs_result(values)
+
+
+async def statvfs(path: StrPath) -> os.statvfs_result:
+    """Return filesystem statistics for ``path`` as an ``os.statvfs_result``.
+
+    Note: libuv exposes fewer fields than ``os.statvfs``; ``f_frsize`` mirrors
+    ``f_bsize``, ``f_favail`` mirrors ``f_ffree``, and ``f_flag`` / ``f_namemax``
+    are reported as 0.
+    """
+    encoded = _fsencode(path)
+    return await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_statfs(loop, req, encoded, cb), _on_statvfs
+    )
 
 
 class DirEntry:
