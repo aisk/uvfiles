@@ -71,55 +71,45 @@ class AsyncFile:
 
     @property
     def name(self) -> str:
-        """The file name."""
         return self._name
 
     @property
     def mode(self) -> str:
-        """The file mode."""
         return self._mode
 
     @property
     def closed(self) -> bool:
-        """True if the file is closed."""
         return self._closed
 
     @property
     def encoding(self) -> Optional[str]:
-        """The text encoding."""
         return self._encoding
 
     @property
     def errors(self) -> Optional[str]:
-        """The text error strategy."""
         return self._errors
 
     def fileno(self) -> int:
-        """Return the file descriptor."""
         if self._closed:
             raise ValueError("I/O operation on closed file")
         return self._fd
 
     async def readable(self) -> bool:
-        """Return True if the file is readable."""
         self._ensure_open()
         self._ensure_loop()
         return "r" in self._mode or "+" in self._mode
 
     async def writable(self) -> bool:
-        """Return True if the file is writable."""
         self._ensure_open()
         self._ensure_loop()
         return "w" in self._mode or "a" in self._mode or "+" in self._mode
 
     async def seekable(self) -> bool:
-        """Return True if the file is seekable."""
         self._ensure_open()
         self._ensure_loop()
         return True
 
     async def isatty(self) -> bool:
-        """Return True if the file is connected to a TTY device."""
         self._ensure_open()
         self._ensure_loop()
         return uv.uv_guess_handle(self._fd) == UV_TTY_HANDLE_TYPE
@@ -329,11 +319,9 @@ class AsyncFile:
             self._closed = True
 
     def __enter__(self) -> "AsyncFile":
-        """Enter the runtime context."""
         raise TypeError("AsyncFile only supports async context manager, use 'async with'")
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Exit the runtime context and close the file."""
         raise TypeError("AsyncFile only supports async context manager, use 'async with'")
 
     async def __aenter__(self) -> "AsyncFile":
@@ -357,11 +345,9 @@ class AsyncFile:
         return line
 
     def __iter__(self) -> Iterator[bytes]:
-        """Iterate over lines in the file."""
         raise TypeError("AsyncFile is asynchronously iterable, use 'async for'")
 
     def __next__(self) -> bytes:
-        """Return the next line from the file."""
         raise TypeError("AsyncFile is asynchronously iterable, use 'async for'")
 
     def __repr__(self) -> str:

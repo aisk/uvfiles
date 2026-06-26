@@ -8,9 +8,7 @@ Its goal is to provide `libuv`'s portability and, on Linux, leverage `io_uring` 
 - Python 3.10+
 - [`uvloop`](https://github.com/MagicStack/uvloop) (a hard runtime dependency)
 
-Because `uvfiles` runs on `uvloop`, it supports the same platforms as `uvloop`: **Linux and macOS**. Windows is not supported. On Linux, file operations transparently use `libuv`'s `io_uring` backend when the kernel provides it.
-
-`uvfiles` only works with a `uvloop` event loop; using it on the stdlib asyncio loop raises a clear `RuntimeError`.
+`uvfiles` runs only on a `uvloop` event loop — the stdlib asyncio loop raises a clear `RuntimeError`. It therefore supports the same platforms as `uvloop`: **Linux and macOS** (Windows is not supported). On Linux, file operations transparently use `libuv`'s `io_uring` backend when the kernel provides it.
 
 ## Installation
 
@@ -47,13 +45,11 @@ asyncio.run(main())
 
 ## API
 
-The public API mirrors `aiofiles` and Python's builtin `open()`.
-
 ### `uvfiles.open` / `uvfiles.async_open`
 
 Two names for the same function. It returns an awaitable that resolves to an `AsyncFile`. It accepts either a builtin-style mode string (`"r"`, `"w+b"`, `"a"`, `"x"`, ...) or an integer `os.O_*` flag bitmask, plus `encoding` / `errors` / `newline` for text mode.
 
-`AsyncFile` is a file-object-shaped wrapper whose methods are coroutines: `read`, `readall`, `read1`, `readline`, `readlines`, `readinto`, `write`, `writelines`, `seek`, `tell`, `truncate`, `flush`, `close`, `readable`, `writable`, `seekable`, `isatty`, plus `async with` and `async for`. Operations on a single file object are serialized with a lock, so concurrent coroutines cannot corrupt its position.
+`AsyncFile` mirrors the builtin file object, with every method (`read`, `write`, `seek`, ...) and `async for` as a coroutine, and `async with` for context management. Operations on a single file object are serialized with a lock, so concurrent coroutines cannot corrupt its position.
 
 ### `uvfiles.os`
 
