@@ -39,6 +39,13 @@ class uv_buf_t(Structure):
     ]
 
 
+class uv_dirent_t(Structure):
+    _fields_ = [
+        ("name", c_char_p),
+        ("type", c_int),
+    ]
+
+
 class uv_timespec_t(Structure):
     _fields_ = [
         ("tv_sec", c_long),
@@ -213,6 +220,21 @@ uv.uv_fs_lstat.argtypes = [
 ]
 uv.uv_fs_lstat.restype = c_int
 
+uv.uv_fs_scandir.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_int,
+    c_void_p,
+]
+uv.uv_fs_scandir.restype = c_int
+
+uv.uv_fs_scandir_next.argtypes = [
+    POINTER(uv_fs_t),
+    POINTER(uv_dirent_t),
+]
+uv.uv_fs_scandir_next.restype = c_int
+
 uv.uv_fs_req_cleanup.argtypes = [POINTER(uv_fs_t)]
 uv.uv_fs_req_cleanup.restype = None
 
@@ -228,6 +250,16 @@ uv.uv_guess_handle.restype = c_int
 UV_FS_CB = CFUNCTYPE(None, POINTER(uv_fs_t))
 UV_FS_REQ_TYPE = 6
 UV_TTY_HANDLE_TYPE = 14
+
+# uv_dirent_type_t
+UV_DIRENT_UNKNOWN = 0
+UV_DIRENT_FILE = 1
+UV_DIRENT_DIR = 2
+UV_DIRENT_LINK = 3
+UV_DIRENT_FIFO = 4
+UV_DIRENT_SOCKET = 5
+UV_DIRENT_CHAR = 6
+UV_DIRENT_BLOCK = 7
 
 ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
 ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
