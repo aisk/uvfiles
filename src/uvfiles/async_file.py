@@ -59,6 +59,10 @@ class AsyncFile:
         self._newline = newline if not binary else None
         self._pos = os.fstat(fd).st_size if append else 0
         self._closed = False
+        # Serializes operations on this file object. libuv reads/writes are
+        # positional and span multiple awaits, so concurrent coroutines on the
+        # same file would interleave and corrupt self._pos and the read buffers.
+        self._lock = asyncio.Lock()
         self._read_buffer = bytearray()
         self._text_buffer = ""
         self._text_pending_cr = False
@@ -124,7 +128,10 @@ class AsyncFile:
         """Read and return up to size bytes."""
         self._ensure_open()
         self._ensure_loop()
+        async with self._lock:
+            return await self._read_locked(size)
 
+    async def _read_locked(self, size: int = -1) -> Any:
         if size == 0:
             return b"" if self._binary else ""
 
@@ -136,7 +143,10 @@ class AsyncFile:
         """Read and return one line from the file."""
         self._ensure_open()
         self._ensure_loop()
+        async with self._lock:
+            return await self._readline_locked(size)
 
+    async def _readline_locked(self, size: int = -1) -> Any:
         if size == 0:
             return b"" if self._binary else ""
 
@@ -153,16 +163,17 @@ class AsyncFile:
         total = 0
         eof = b"" if self._binary else ""
 
-        while True:
-            line = await self.readline()
-            if line == eof:
-                break
+        async with self._lock:
+            while True:
+                line = await self._readline_locked()
+                if line == eof:
+                    break
 
-            lines.append(line)
-            total += len(line)
+                lines.append(line)
+                total += len(line)
 
-            if hint > 0 and total >= hint:
-                break
+                if hint > 0 and total >= hint:
+                    break
 
         return lines
 
@@ -170,7 +181,10 @@ class AsyncFile:
         """Write data to the file."""
         self._ensure_open()
         self._ensure_loop()
+        async with self._lock:
+            return await self._write_locked(data)
 
+    async def _write_locked(self, data: Any) -> int:
         if self._binary:
             if not isinstance(data, (bytes, bytearray, memoryview)):
                 raise TypeError(
@@ -200,8 +214,9 @@ class AsyncFile:
         self._ensure_open()
         self._ensure_loop()
 
-        for line in lines:
-            await self.write(line)
+        async with self._lock:
+            for line in lines:
+                await self._write_locked(line)
 
     async def readinto(self, buffer: Any) -> int:
         """Read bytes into a writable buffer and return the byte count."""
@@ -216,7 +231,8 @@ class AsyncFile:
             raise TypeError("readinto() argument must be read-write bytes-like object")
 
         byte_view = view.cast("B")
-        data = await self.read(len(byte_view))
+        async with self._lock:
+            data = await self._read_locked(len(byte_view))
         size = len(data)
         byte_view[:size] = data
         return size
@@ -226,21 +242,22 @@ class AsyncFile:
         self._ensure_open()
         self._ensure_loop()
 
-        if whence == os.SEEK_SET:
-            new_pos = offset
-        elif whence == os.SEEK_CUR:
-            new_pos = self._pos + offset
-        elif whence == os.SEEK_END:
-            new_pos = await self._fstat_once() + offset
-        else:
-            raise ValueError("invalid whence")
+        async with self._lock:
+            if whence == os.SEEK_SET:
+                new_pos = offset
+            elif whence == os.SEEK_CUR:
+                new_pos = self._pos + offset
+            elif whence == os.SEEK_END:
+                new_pos = await self._fstat_once() + offset
+            else:
+                raise ValueError("invalid whence")
 
-        if new_pos < 0:
-            raise ValueError("negative seek position")
+            if new_pos < 0:
+                raise ValueError("negative seek position")
 
-        self._pos = new_pos
-        self._reset_read_state()
-        return self._pos
+            self._pos = new_pos
+            self._reset_read_state()
+            return self._pos
 
     async def tell(self) -> int:
         """Return the current stream position."""
@@ -253,23 +270,25 @@ class AsyncFile:
         self._ensure_open()
         self._ensure_loop()
 
-        target_size = self._pos if size is None else size
-        if target_size < 0:
-            raise ValueError("negative size value")
+        async with self._lock:
+            target_size = self._pos if size is None else size
+            if target_size < 0:
+                raise ValueError("negative size value")
 
-        await self._truncate_once(target_size)
-        self._reset_read_state()
+            await self._truncate_once(target_size)
+            self._reset_read_state()
 
-        if self._pos > target_size:
-            self._pos = target_size
+            if self._pos > target_size:
+                self._pos = target_size
 
-        return target_size
+            return target_size
 
     async def flush(self) -> None:
         """Flush the write buffers."""
         self._ensure_open()
         self._ensure_loop()
-        await self._fsync_once()
+        async with self._lock:
+            await self._fsync_once()
 
     async def close(self) -> None:
         """Close the file."""
@@ -277,8 +296,11 @@ class AsyncFile:
             return
 
         self._ensure_loop()
-        await self._close_once()
-        self._closed = True
+        async with self._lock:
+            if self._closed:
+                return
+            await self._close_once()
+            self._closed = True
 
     def __enter__(self) -> "AsyncFile":
         """Enter the runtime context."""
@@ -300,7 +322,10 @@ class AsyncFile:
         return self
 
     async def __anext__(self) -> Any:
-        line = await self.readline()
+        self._ensure_open()
+        self._ensure_loop()
+        async with self._lock:
+            line = await self._readline_locked()
         if line == (b"" if self._binary else ""):
             raise StopAsyncIteration
         return line
