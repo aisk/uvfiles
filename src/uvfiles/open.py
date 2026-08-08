@@ -154,7 +154,7 @@ def open(
         try:
             if result < 0:
                 if not fut.done():
-                    fut.set_exception(_error_from_result(result))
+                    fut.set_exception(_error_from_result(result, resolved_path))
             else:
                 if not fut.done():
                     fut.set_result(
@@ -182,7 +182,7 @@ def open(
 
     if result < 0:
         _cleanup_fs_request(req_ptr, req_addr)
-        fut.set_exception(_error_from_result(result))
+        fut.set_exception(_error_from_result(result, resolved_path))
 
     return fut
 

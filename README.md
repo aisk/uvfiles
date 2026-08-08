@@ -51,6 +51,8 @@ Two names for the same function. It returns an awaitable that resolves to an `As
 
 `AsyncFile` mirrors the builtin file object, with every method (`read`, `write`, `seek`, ...) and `async for` as a coroutine, and `async with` for context management. Operations on a single file object are serialized with a lock, so concurrent coroutines cannot corrupt its position.
 
+Failures raise the same `OSError` subclasses as the stdlib (`FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, ...), with `errno` and `filename` populated.
+
 ### `uvfiles.os`
 
 Async equivalents of `os` / `aiofiles.os` filesystem helpers:

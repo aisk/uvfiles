@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import errno
 import os
 import stat as stat_module
 
@@ -938,3 +939,92 @@ async def test_os_lstat_does_not_follow_symlink(tmp_path):
     assert stat_module.S_ISLNK(link_stat.st_mode)
     assert not stat_module.S_ISLNK(target_stat.st_mode)
     assert target_stat.st_size == 4
+
+
+@pytest.mark.asyncio
+async def test_open_missing_file_raises_file_not_found(tmp_path):
+    path = tmp_path / "missing.txt"
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        await uvfiles.open(str(path), "r")
+
+    assert excinfo.value.errno == errno.ENOENT
+    assert excinfo.value.filename == str(path)
+
+
+@pytest.mark.asyncio
+async def test_open_exclusive_existing_raises_file_exists(tmp_path):
+    path = tmp_path / "exists.txt"
+    path.write_bytes(b"x")
+
+    with pytest.raises(FileExistsError) as excinfo:
+        await uvfiles.open(str(path), "x")
+
+    assert excinfo.value.errno == errno.EEXIST
+    assert excinfo.value.filename == str(path)
+
+
+@pytest.mark.asyncio
+async def test_open_directory_raises_is_a_directory(tmp_path):
+    with pytest.raises(IsADirectoryError):
+        await uvfiles.open(str(tmp_path), "w")
+
+
+@pytest.mark.asyncio
+async def test_os_errors_map_to_oserror_subclasses(tmp_path):
+    missing = tmp_path / "missing"
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        await uvos.remove(missing)
+    assert excinfo.value.errno == errno.ENOENT
+    assert excinfo.value.filename == str(missing)
+
+    with pytest.raises(FileNotFoundError):
+        await uvos.stat(missing)
+
+    existing = tmp_path / "dir"
+    existing.mkdir()
+    with pytest.raises(FileExistsError):
+        await uvos.mkdir(existing)
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        await uvos.rename(missing, tmp_path / "dst")
+    assert excinfo.value.filename == str(missing)
+    assert excinfo.value.filename2 == str(tmp_path / "dst")
+
+
+@pytest.mark.asyncio
+async def test_os_makedirs_tail_exists_inside_existing_parent(tmp_path):
+    # Exercises the recursive branch that swallows FileExistsError when an
+    # intermediate directory already exists.
+    (tmp_path / "a").mkdir()
+    await uvos.makedirs(tmp_path / "a" / "b" / "c")
+    assert (tmp_path / "a" / "b" / "c").is_dir()
+    await uvos.makedirs(tmp_path / "a" / "b" / "c", exist_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_text_readline_spanning_chunks(tmp_path):
+    # A line longer than the 8 KiB read chunk must be assembled across reads.
+    path = tmp_path / "long_line.txt"
+    long_line = "x" * 20000
+    path.write_text(long_line + "\n" + "tail\n", encoding="utf-8")
+
+    f = await uvfiles.open(str(path), "r")
+    assert await f.readline() == long_line + "\n"
+    assert await f.readline() == "tail\n"
+    assert await f.readline() == ""
+    await f.close()
+
+
+@pytest.mark.asyncio
+async def test_text_readline_size_limit(tmp_path):
+    path = tmp_path / "limit.txt"
+    path.write_text("abcdef\nxyz\n", encoding="utf-8")
+
+    f = await uvfiles.open(str(path), "r")
+    assert await f.readline(3) == "abc"
+    assert await f.readline(3) == "def"
+    assert await f.readline(3) == "\n"
+    assert await f.readline() == "xyz\n"
+    await f.close()

@@ -403,9 +403,17 @@ def _cleanup_fs_request(req_ptr: Any, req_addr: Optional[int] = None) -> None:
     context.req_buf = None
 
 
-def _error_from_result(result: int) -> OSError:
+def _error_from_result(
+    result: int,
+    filename: Optional[str] = None,
+    filename2: Optional[str] = None,
+) -> OSError:
     error_str = uv.uv_strerror(result)
-    return OSError(result, error_str.decode() if error_str else "Unknown error")
+    message = error_str.decode() if error_str else "Unknown error"
+    # libuv error codes are negative errno values on the platforms uvloop
+    # supports; negate so OSError resolves to its errno-specific subclass
+    # (FileNotFoundError, FileExistsError, ...) like the stdlib does.
+    return OSError(-result, message, filename, None, filename2)
 
 
 def _get_uv_loop_ptr(event_loop: asyncio.AbstractEventLoop) -> Any:

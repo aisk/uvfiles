@@ -70,6 +70,8 @@ async def _run_fs(
     on_success: Optional[Callable[[Any], Any]] = None,
     *,
     raise_on_error: bool = True,
+    path: Optional[StrPath] = None,
+    path2: Optional[StrPath] = None,
 ) -> Any:
     """Run a single libuv fs op on the running loop and await its result.
 
@@ -78,11 +80,16 @@ async def _run_fs(
     when ``result >= 0`` to build the value the coroutine resolves to; when it is
     ``None`` the coroutine resolves to ``None``. When ``raise_on_error`` is False
     a negative ``result`` resolves to that integer instead of raising (used by
-    ``access``, which reports failure as a bool). Follows the same lifetime rules
-    as the ``_*_once`` helpers in async_file.py.
+    ``access``, which reports failure as a bool). ``path`` / ``path2`` become the
+    OSError ``filename`` / ``filename2`` attributes on failure, matching the
+    stdlib. Follows the same lifetime rules as the ``_*_once`` helpers in
+    async_file.py.
     """
     loop = asyncio.get_running_loop()
     uv_loop = _get_uv_loop_ptr(loop)
+
+    filename = None if path is None else os.fspath(path)
+    filename2 = None if path2 is None else os.fspath(path2)
 
     fut = loop.create_future()
     req_ptr, req_addr = _alloc_fs_request()
@@ -94,7 +101,9 @@ async def _run_fs(
             if result < 0:
                 if not fut.done():
                     if raise_on_error:
-                        fut.set_exception(_error_from_result(result))
+                        fut.set_exception(
+                            _error_from_result(result, filename, filename2)
+                        )
                     else:
                         fut.set_result(int(result))
             else:
@@ -117,7 +126,7 @@ async def _run_fs(
     if result < 0:
         _cleanup_fs_request(req_ptr, req_addr)
         if raise_on_error:
-            raise _error_from_result(result)
+            raise _error_from_result(result, filename, filename2)
         return int(result)
 
     return await fut
@@ -166,7 +175,9 @@ def _on_stat(req_ptr: Any) -> os.stat_result:
 async def remove(path: StrPath) -> None:
     """Remove (delete) the file ``path``."""
     encoded = _fsencode(path)
-    await _run_fs(lambda loop, req, cb: uv.uv_fs_unlink(loop, req, encoded, cb))
+    await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_unlink(loop, req, encoded, cb), path=path
+    )
 
 
 unlink = remove
@@ -177,27 +188,35 @@ async def rename(src: StrPath, dst: StrPath) -> None:
     src_encoded = _fsencode(src)
     dst_encoded = _fsencode(dst)
     await _run_fs(
-        lambda loop, req, cb: uv.uv_fs_rename(loop, req, src_encoded, dst_encoded, cb)
+        lambda loop, req, cb: uv.uv_fs_rename(loop, req, src_encoded, dst_encoded, cb),
+        path=src,
+        path2=dst,
     )
 
 
 async def mkdir(path: StrPath, mode: int = 0o777) -> None:
     """Create a directory named ``path`` with numeric ``mode``."""
     encoded = _fsencode(path)
-    await _run_fs(lambda loop, req, cb: uv.uv_fs_mkdir(loop, req, encoded, mode, cb))
+    await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_mkdir(loop, req, encoded, mode, cb), path=path
+    )
 
 
 async def rmdir(path: StrPath) -> None:
     """Remove (delete) the directory ``path``."""
     encoded = _fsencode(path)
-    await _run_fs(lambda loop, req, cb: uv.uv_fs_rmdir(loop, req, encoded, cb))
+    await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_rmdir(loop, req, encoded, cb), path=path
+    )
 
 
 async def stat(path: StrPath) -> os.stat_result:
     """Return an ``os.stat_result`` for ``path``, following symlinks."""
     encoded = _fsencode(path)
     return await _run_fs(
-        lambda loop, req, cb: uv.uv_fs_stat(loop, req, encoded, cb), _on_stat
+        lambda loop, req, cb: uv.uv_fs_stat(loop, req, encoded, cb),
+        _on_stat,
+        path=path,
     )
 
 
@@ -205,7 +224,9 @@ async def lstat(path: StrPath) -> os.stat_result:
     """Like :func:`stat`, but do not follow symlinks."""
     encoded = _fsencode(path)
     return await _run_fs(
-        lambda loop, req, cb: uv.uv_fs_lstat(loop, req, encoded, cb), _on_stat
+        lambda loop, req, cb: uv.uv_fs_lstat(loop, req, encoded, cb),
+        _on_stat,
+        path=path,
     )
 
 
@@ -225,7 +246,9 @@ async def link(src: StrPath, dst: StrPath) -> None:
     src_encoded = _fsencode(src)
     dst_encoded = _fsencode(dst)
     await _run_fs(
-        lambda loop, req, cb: uv.uv_fs_link(loop, req, src_encoded, dst_encoded, cb)
+        lambda loop, req, cb: uv.uv_fs_link(loop, req, src_encoded, dst_encoded, cb),
+        path=src,
+        path2=dst,
     )
 
 
@@ -242,7 +265,9 @@ async def symlink(
     await _run_fs(
         lambda loop, req, cb: uv.uv_fs_symlink(
             loop, req, src_encoded, dst_encoded, 0, cb
-        )
+        ),
+        path=src,
+        path2=dst,
     )
 
 
@@ -258,7 +283,9 @@ async def readlink(path: StrPath) -> str:
     """Return the path the symbolic link ``path`` points to."""
     encoded = _fsencode(path)
     return await _run_fs(
-        lambda loop, req, cb: uv.uv_fs_readlink(loop, req, encoded, cb), _on_readlink
+        lambda loop, req, cb: uv.uv_fs_readlink(loop, req, encoded, cb),
+        _on_readlink,
+        path=path,
     )
 
 
@@ -329,7 +356,9 @@ async def statvfs(path: StrPath) -> os.statvfs_result:
     """
     encoded = _fsencode(path)
     return await _run_fs(
-        lambda loop, req, cb: uv.uv_fs_statfs(loop, req, encoded, cb), _on_statvfs
+        lambda loop, req, cb: uv.uv_fs_statfs(loop, req, encoded, cb),
+        _on_statvfs,
+        path=path,
     )
 
 
@@ -445,6 +474,7 @@ async def listdir(path: StrPath = ".") -> List[str]:
     return await _run_fs(
         lambda loop, req, cb: uv.uv_fs_scandir(loop, req, encoded, 0, cb),
         lambda req_ptr: [name for name, _type in _iter_dirents(req_ptr)],
+        path=path,
     )
 
 
@@ -462,6 +492,7 @@ async def scandir(path: StrPath = ".") -> ScandirResult:
     return await _run_fs(
         lambda loop, req, cb: uv.uv_fs_scandir(loop, req, encoded, 0, cb),
         on_scandir,
+        path=base,
     )
 
 
