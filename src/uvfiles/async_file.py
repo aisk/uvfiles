@@ -494,6 +494,14 @@ class AsyncFile:
 
     async def _readline_text(self, size: int = -1) -> str:
         limit = None if size < 0 else size
+
+        # With newline=None reads are already translated to "\n", and with
+        # newline="\n" the terminator is literally "\n", so the line end can be
+        # found by scanning the decoded buffer in bulk. The exotic modes
+        # ("\r", "\r\n", "") fall through to the char-by-char loop below.
+        if self._newline is None or self._newline == "\n":
+            return await self._readline_text_simple(limit)
+
         chunks: List[str] = []
         total = 0
 
@@ -539,6 +547,38 @@ class AsyncFile:
                     else:
                         self._text_buffer = next_ch + self._text_buffer
                     return "".join(chunks)
+
+    async def _readline_text_simple(self, limit: Optional[int]) -> str:
+        chunks: List[str] = []
+        total = 0
+        eof = False
+
+        while True:
+            if not self._text_buffer:
+                if eof:
+                    return "".join(chunks)
+                data = await self._read_once(8 * 1024, self._pos)
+                if data:
+                    self._pos += len(data)
+                    self._append_decoded_text(data)
+                else:
+                    self._finalize_text_decoder()
+                    eof = True
+                continue
+
+            scan_len = len(self._text_buffer)
+            if limit is not None:
+                scan_len = min(scan_len, limit - total)
+                if scan_len <= 0:
+                    return "".join(chunks)
+
+            newline_idx = self._text_buffer.find("\n", 0, scan_len)
+            take = newline_idx + 1 if newline_idx != -1 else scan_len
+            chunks.append(self._consume_text_buffer(take))
+            total += take
+
+            if newline_idx != -1 or (limit is not None and total >= limit):
+                return "".join(chunks)
 
     def _append_decoded_text(self, data: bytes, *, final: bool = False) -> None:
         if self._text_decoder is None:
