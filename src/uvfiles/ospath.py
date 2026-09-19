@@ -2,10 +2,9 @@
 
 The metadata predicates (``exists`` / ``isfile`` / ... / ``samefile``) run on
 libuv through :mod:`uvfiles.os` ``stat`` / ``lstat`` so they are genuinely
-non-blocking. ``abspath``, ``ismount`` and ``sameopenfile`` delegate to the
-stdlib: they are pure path logic or cheap already-open-fd metadata, so
-reimplementing them on libuv buys nothing and risks diverging from ``os.path``
-semantics.
+non-blocking, as do ``sameopenfile`` and ``ismount``. ``abspath`` delegates to
+the stdlib: it is pure path logic that at most reads the cwd, which involves no
+filesystem I/O.
 """
 
 import os
@@ -101,8 +100,9 @@ async def samefile(path1: StrPath, path2: StrPath) -> bool:
 
 async def sameopenfile(fd1: int, fd2: int) -> bool:
     """Return True if the two open file descriptors refer to the same file."""
-    # Operates on already-open fds; only touches cached inode metadata.
-    return os.path.sameopenfile(fd1, fd2)
+    s1 = await _aos._fstat(fd1)
+    s2 = await _aos._fstat(fd2)
+    return os.path.samestat(s1, s2)
 
 
 async def abspath(path: StrPath) -> str:
@@ -113,6 +113,22 @@ async def abspath(path: StrPath) -> str:
 
 async def ismount(path: StrPath) -> bool:
     """Return True if ``path`` is a mount point."""
-    # Rare call with subtle parent/realpath comparison logic; delegate to stdlib
-    # rather than risk diverging from os.path semantics.
-    return os.path.ismount(path)
+    # Same checks as posixpath.ismount, with the syscalls routed through libuv.
+    try:
+        s1 = await _aos.lstat(path)
+    except (OSError, ValueError):
+        return False
+    if _stat.S_ISLNK(s1.st_mode):
+        return False
+
+    # ``path`` exists and is not a symlink, so the parent of its canonical form
+    # is what the stdlib's realpath(join(path, "..")) resolves to.
+    try:
+        parent = os.path.dirname(await _aos._realpath(path))
+        s2 = await _aos.lstat(parent)
+    except (OSError, ValueError):
+        return False
+
+    if s1.st_dev != s2.st_dev:
+        return True  # path/.. on a different device as path
+    return s1.st_ino == s2.st_ino  # path/.. is the same i-node as path

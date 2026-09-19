@@ -80,3 +80,33 @@ async def test_ospath_samefile(tmp_path):
 @pytest.mark.asyncio
 async def test_ospath_abspath():
     assert await uvos.path.abspath("foo") == os.path.abspath("foo")
+
+
+@pytest.mark.asyncio
+async def test_ospath_sameopenfile(tmp_path):
+    f = tmp_path / "f.txt"
+    f.write_text("x", encoding="utf-8")
+    other = tmp_path / "other.txt"
+    other.write_text("x", encoding="utf-8")
+
+    fd1 = os.open(f, os.O_RDONLY)
+    fd2 = os.open(f, os.O_RDONLY)
+    fd3 = os.open(other, os.O_RDONLY)
+    try:
+        assert await uvos.path.sameopenfile(fd1, fd2) is True
+        assert await uvos.path.sameopenfile(fd1, fd3) is False
+    finally:
+        for fd in (fd1, fd2, fd3):
+            os.close(fd)
+
+
+@pytest.mark.asyncio
+async def test_ospath_ismount_matches_stdlib(tmp_path):
+    f = tmp_path / "f.txt"
+    f.write_text("x", encoding="utf-8")
+    link = tmp_path / "rootlink"
+    link.symlink_to("/")
+
+    candidates = ["/", "/proc", "/dev", "/tmp", tmp_path, f, link, tmp_path / "nope"]
+    for candidate in candidates:
+        assert await uvos.path.ismount(candidate) is os.path.ismount(candidate), candidate

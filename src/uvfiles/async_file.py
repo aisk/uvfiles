@@ -39,7 +39,7 @@ class AsyncFile:
         encoding: Optional[str] = None,
         errors: Optional[str] = None,
         newline: Optional[str] = None,
-        append: bool = False,
+        pos: int = 0,
     ) -> None:
         if not binary:
             if encoding is None:
@@ -57,7 +57,7 @@ class AsyncFile:
         self._encoding = encoding if not binary else None
         self._errors = errors if not binary else None
         self._newline = newline if not binary else None
-        self._pos = os.fstat(fd).st_size if append else 0
+        self._pos = pos
         self._closed = False
         # Serializes operations on this file object. libuv reads/writes are
         # positional and span multiple awaits, so concurrent coroutines on the

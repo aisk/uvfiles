@@ -15,6 +15,7 @@ import shutil as _shutil
 import tempfile as _tempfile
 from typing import Any, Awaitable, Callable, Optional, Tuple
 
+from . import os as _aos
 from .async_file import AsyncFile, _validate_newline
 from .open import _parse_mode
 
@@ -79,9 +80,7 @@ class _TempAsyncFile(AsyncFile):
         await super().close()
         if was_open and self._delete_path is not None:
             try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, os.unlink, self._delete_path
-                )
+                await _aos.unlink(self._delete_path)
             except OSError:
                 pass
             self._delete_path = None

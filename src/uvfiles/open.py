@@ -2,7 +2,7 @@ import asyncio
 import ctypes
 import os
 from ctypes import POINTER
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from .async_file import AsyncFile, _validate_newline
 from .uv import (
@@ -13,8 +13,35 @@ from .uv import (
     _get_uv_loop_ptr,
     _set_request_callback,
     uv,
+    uv_fs_req_stat_view_t,
     uv_fs_req_view_t,
 )
+
+
+def _submit_fs_request(
+    call: Callable[[Any, Any], int], on_done: Callable[[Any, int], None]
+) -> int:
+    """Start a libuv fs request; ``on_done(req_ptr, result)`` runs on completion.
+
+    Returns libuv's submission status; when it is negative ``on_done`` is never
+    called.
+    """
+    req_ptr, req_addr = _alloc_fs_request()
+
+    def fs_callback(req_ptr):
+        req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
+        try:
+            on_done(req_ptr, req_view.result)
+        finally:
+            _cleanup_fs_request(req_ptr)
+
+    cb = UV_FS_CB(fs_callback)
+    _set_request_callback(req_addr, cb)
+
+    result = call(req_ptr, cb)
+    if result < 0:
+        _cleanup_fs_request(req_ptr, req_addr)
+    return result
 
 
 def _flags_to_mode(flags: int) -> str:
@@ -122,8 +149,6 @@ def open(
 
     uv_loop = _get_uv_loop_ptr(loop)
 
-    req_ptr, req_addr = _alloc_fs_request()
-
     fut = loop.create_future()
     resolved_encoding: Optional[str] = None
     resolved_errors: Optional[str] = None
@@ -147,41 +172,75 @@ def open(
             resolved_errors = errors or "strict"
             resolved_newline = newline
 
-    def fs_callback(req_ptr):
-        req_view = ctypes.cast(req_ptr, POINTER(uv_fs_req_view_t)).contents
-        result = req_view.result
+    def close_fd(fd: int) -> None:
+        _submit_fs_request(
+            lambda req, cb: uv.uv_fs_close(uv_loop, req, fd, cb),
+            lambda req_ptr, result: None,
+        )
 
+    def resolve(fd: int, pos: int) -> None:
+        if fut.done():
+            # Cancelled while the open was in flight; nobody will own the fd.
+            close_fd(fd)
+            return
         try:
-            if result < 0:
-                if not fut.done():
-                    fut.set_exception(_error_from_result(result, resolved_path))
-            else:
-                if not fut.done():
-                    fut.set_result(
-                        AsyncFile(
-                            result,
-                            resolved_path,
-                            loop,
-                            file_mode,
-                            binary=binary,
-                            encoding=resolved_encoding,
-                            errors=resolved_errors,
-                            newline=resolved_newline,
-                            append=append,
-                        )
-                    )
-        finally:
-            _cleanup_fs_request(req_ptr)
+            file = AsyncFile(
+                fd,
+                resolved_path,
+                loop,
+                file_mode,
+                binary=binary,
+                encoding=resolved_encoding,
+                errors=resolved_errors,
+                newline=resolved_newline,
+                pos=pos,
+            )
+        except BaseException as exc:
+            # An exception escaping a ctypes callback would be swallowed and
+            # leave the awaiter hung forever.
+            close_fd(fd)
+            fut.set_exception(exc)
+        else:
+            fut.set_result(file)
 
-    cb = UV_FS_CB(fs_callback)
-    _set_request_callback(req_addr, cb)
+    def fail(fd: int, result: int) -> None:
+        close_fd(fd)
+        if not fut.done():
+            fut.set_exception(_error_from_result(result, resolved_path))
 
-    result = uv.uv_fs_open(
-        uv_loop, req_ptr, os.fsencode(resolved_path), flags, mode, cb
+    def on_fstat(fd: int, req_ptr: Any, result: int) -> None:
+        if result < 0:
+            fail(fd, result)
+            return
+        view = ctypes.cast(req_ptr, POINTER(uv_fs_req_stat_view_t)).contents
+        resolve(fd, int(view.statbuf.st_size))
+
+    def on_open(req_ptr: Any, result: int) -> None:
+        if result < 0:
+            if not fut.done():
+                fut.set_exception(_error_from_result(result, resolved_path))
+            return
+
+        fd = int(result)
+        if not append:
+            resolve(fd, 0)
+            return
+
+        # Append mode starts at EOF; ask libuv for the size rather than block
+        # the loop on os.fstat.
+        submitted = _submit_fs_request(
+            lambda req, cb: uv.uv_fs_fstat(uv_loop, req, fd, cb),
+            lambda req_ptr, result: on_fstat(fd, req_ptr, result),
+        )
+        if submitted < 0:
+            fail(fd, submitted)
+
+    encoded_path = os.fsencode(resolved_path)
+    result = _submit_fs_request(
+        lambda req, cb: uv.uv_fs_open(uv_loop, req, encoded_path, flags, mode, cb),
+        on_open,
     )
-
     if result < 0:
-        _cleanup_fs_request(req_ptr, req_addr)
         fut.set_exception(_error_from_result(result, resolved_path))
 
     return fut

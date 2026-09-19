@@ -299,6 +299,14 @@ uv.uv_fs_readlink.argtypes = [
 ]
 uv.uv_fs_readlink.restype = c_int
 
+uv.uv_fs_realpath.argtypes = [
+    POINTER(uv_loop_t),
+    POINTER(uv_fs_t),
+    c_char_p,
+    c_void_p,
+]
+uv.uv_fs_realpath.restype = c_int
+
 uv.uv_fs_sendfile.argtypes = [
     POINTER(uv_loop_t),
     POINTER(uv_fs_t),

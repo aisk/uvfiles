@@ -230,6 +230,13 @@ async def lstat(path: StrPath) -> os.stat_result:
     )
 
 
+async def _fstat(fd: int) -> os.stat_result:
+    """Like :func:`stat`, but for an open file descriptor."""
+    return await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_fstat(loop, req, fd, cb), _on_stat
+    )
+
+
 async def access(path: StrPath, mode: int) -> bool:
     """Return True if the calling user can access ``path`` with the given mode."""
     encoded = _fsencode(path)
@@ -284,6 +291,16 @@ async def readlink(path: StrPath) -> str:
     encoded = _fsencode(path)
     return await _run_fs(
         lambda loop, req, cb: uv.uv_fs_readlink(loop, req, encoded, cb),
+        _on_readlink,
+        path=path,
+    )
+
+
+async def _realpath(path: StrPath) -> str:
+    """Return the canonical path of ``path``, which must exist (realpath(3))."""
+    encoded = _fsencode(path)
+    return await _run_fs(
+        lambda loop, req, cb: uv.uv_fs_realpath(loop, req, encoded, cb),
         _on_readlink,
         path=path,
     )
