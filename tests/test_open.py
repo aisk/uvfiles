@@ -132,3 +132,53 @@ async def test_open_exclusive_existing_raises_file_exists(tmp_path):
 async def test_open_directory_raises_is_a_directory(tmp_path):
     with pytest.raises(IsADirectoryError):
         await uvfiles.open(str(tmp_path), "w")
+
+
+@pytest.mark.asyncio
+async def test_open_append_starts_at_end_without_blocking_fstat(tmp_path, monkeypatch):
+    path = tmp_path / "append.bin"
+    path.write_bytes(b"hello")
+
+    def blocking_fstat(fd):
+        raise AssertionError("open() must not call the blocking os.fstat")
+
+    monkeypatch.setattr(os, "fstat", blocking_fstat)
+
+    f = await uvfiles.open(str(path), "ab")
+    try:
+        assert await f.tell() == 5
+        await f.write(b" world")
+        assert await f.tell() == 11
+    finally:
+        await f.close()
+
+    assert path.read_bytes() == b"hello world"
+
+
+@pytest.mark.asyncio
+async def test_open_append_int_flags_starts_at_end(tmp_path):
+    path = tmp_path / "append_flags.bin"
+    path.write_bytes(b"abc")
+
+    f = await uvfiles.open(str(path), os.O_WRONLY | os.O_APPEND)
+    try:
+        assert await f.tell() == 3
+    finally:
+        await f.close()
+
+
+@pytest.mark.asyncio
+async def test_open_cancelled_does_not_leak_fd(tmp_path):
+    path = tmp_path / "cancelled.bin"
+    path.write_bytes(b"x")
+
+    before = set(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+
+    fut = uvfiles.open(str(path), "ab")
+    fut.cancel()
+    # Let the in-flight open and the follow-up close complete.
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+
+    if before is not None:
+        assert set(os.listdir("/proc/self/fd")) <= before
